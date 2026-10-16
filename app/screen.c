@@ -3,6 +3,7 @@
 #include "fm_patch.h"
 #include "version.h"
 #include "fm1_engine_control.h"
+#include "gtr_part.h"
 #include <string.h>
 enum {
     BACK = 0x0000,
@@ -345,6 +346,12 @@ static int post(uint8_t command, uint8_t a, uint8_t b, unsigned bytes)
         return 1;
     retry_reset = 1;
     return 0;
+}
+/* 吉他语义部件的 Note 下沉口：gtr_part 的队列事件经官方 post() 进引擎。 */
+static void gtr_post_sink(uint8_t command, uint8_t d1, uint8_t d2)
+{
+    /* 路由到当前选中轨道的通道（与官方直弹一致），扫弦声跟轨走 */
+    (void)post((uint8_t)((command & 0xF0) | groove_channel(track)), d1, d2, 3);
 }
 /* Reuse the formatter across panel fields instead of duplicating it at every call. */
 static __attribute__((noinline)) void decimal(char out[12], int value, unsigned digits)
@@ -1804,6 +1811,13 @@ static int apply_controls(const struct fm1_controls *controls, uint32_t now,
     unsigned play_handled = 0;
     previous_buttons = controls->buttons;
     previous_keys = controls->keys;
+    /* B1 吉他语义部件：ENV 按住 + OVERVIEW 页时接管音名键（详见 app/gtr_part.c）。 */
+    gtr_part_set_sink(gtr_post_sink);
+    if (key_down) {                            /* 诊断探针：输入到达闪现 */
+        notice = "INPUT OK";
+        notice_until = now + 400U;
+    }
+    gtr_part_keys(old_keys, controls->keys, now);   /* B1.2：吉他交互常驻 */
     blocked_keys &= controls->keys;
     if (pressed || encoder_active(controls->encoders)) notice = NULL;
     if (retry_reset) {
@@ -2416,6 +2430,7 @@ static int apply_controls(const struct fm1_controls *controls, uint32_t now,
         }
     }
 controls_done:
+    gtr_part_tick(now);
     if (page != old_page) {
         glo_down = glo_used = action_confirm = ble_forget = project_reload = 0;
         if (!(pressed & BUTTON(EDIT))) edit_down = 0;
@@ -2466,6 +2481,16 @@ controls_done:
                 else toggle_step(first + i);
             }
     }
+    /* B1.3 终版：音名键由吉他语义层全权接管（扫弦音量已拉满，
+       实测可闻；官方直弹让位，和弦跟随不再被固定音高的直弹音淹没）。 */
+    if (gtr_part_active()) {
+        for (unsigned gk = 0; gk < 27; ++gk)
+            if (key_note[gk] != 0xff) {
+                if (!post((uint8_t)(0x80 + groove_channel(key_track[gk])), key_note[gk], 0, 3))
+                    return 0;
+                key_note[gk] = 0xff;
+            }
+    } else
     for (unsigned key = 0; key < 27; ++key) {
         unsigned note = groove_key_note(track, key, octave);
         if (key_note[key] != 0xff &&

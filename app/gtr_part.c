@@ -1,0 +1,276 @@
+/* ============================================================================
+   gtr_part.c · 吉他语义部件（B1.2：无模式常驻 + Ample 式白键面板）
+   ----------------------------------------------------------------------------
+   交互（用户拍板：不要模式开关，吉他交互常驻）：
+     · 黑键 11 个 = 选和弦（按下即记住 + 自动轻扫一声确认，耳朵知道选上了）；
+     · 白键 16 个 = Ample 式扫弦面板（官方 white_keys[16] 权威顺序）：
+         W1..W6   单弦拨弦（和弦 6→1 弦各一键）
+         W7       下扫（连点自动下上交替 —— Ample 招牌机制；
+                  换和弦或停 2 秒后重置回下扫）
+         W8       哑音下扫（chuck）
+         W9       上扫
+         W10      闷音下扫（palm mute）
+         W11..W14 节奏型键：folk / pop / punk / reggae（按一下弹一小节）
+         W15/W16  重下扫 / 强上扫
+   · 官方单键直弹在这版固件里让位（换回官方固件即恢复）。
+   静态内存、无动态分配、符号 gtr_part_* 前缀。算法全部来自 gtr_sem。
+   ========================================================================= */
+#include "gtr_part.h"
+#include "gtr_sem.h"
+
+#include <string.h>
+
+#define GTR_CHORD_N   11
+static const uint32_t gtr_chord_bits[GTR_CHORD_N] = {
+    1u << 1,  1u << 3,  1u << 5,  1u << 8,  1u << 10,
+    1u << 13, 1u << 15, 1u << 17, 1u << 20, 1u << 22, 1u << 25
+};
+static const int gtr_chords[GTR_CHORD_N][4] = {
+    { 41, 45, 48, 0 },      /* 0  F  */
+    { 48, 52, 55, 0 },      /* 1  C  */
+    { 43, 47, 50, 55 },     /* 2  G  */
+    { 50, 53, 57, 0 },      /* 3  Dm */
+    { 45, 52, 57, 0 },      /* 4  Am */
+    { 52, 55, 59, 0 },      /* 5  Em */
+    { 43, 47, 50, 53 },     /* 6  G7 */
+    { 40, 44, 47, 50 },     /* 7  E7 */
+    { 50, 54, 57, 60 },     /* 8  D7 */
+    { 46, 50, 53, 0 },      /* 9  Bb */
+    { 45, 49, 52, 55 },     /* 10 A7 */
+};
+
+/* ---- 白键功能表（按官方 white_keys[16] 顺序）---- */
+enum {
+    WK_PLUCK6, WK_PLUCK5, WK_PLUCK4, WK_PLUCK3, WK_PLUCK2, WK_PLUCK1,
+    WK_DOWN_ALT, WK_DOWN_MUTE, WK_UP, WK_PALM,
+    WK_SEQ_FOLK, WK_SEQ_POP, WK_SEQ_PUNK, WK_SEQ_REGGAE,
+    WK_HEAVY, WK_UP_STRONG, WK_W_N
+};
+/* white bit → 功能 */
+static const uint8_t gtr_white_type[16] = {
+    WK_PLUCK6, WK_PLUCK5, WK_PLUCK4, WK_PLUCK3, WK_PLUCK2, WK_PLUCK1,
+    WK_DOWN_ALT, WK_DOWN_MUTE, WK_UP, WK_PALM,
+    WK_SEQ_FOLK, WK_SEQ_POP, WK_SEQ_PUNK, WK_SEQ_REGGAE,
+    WK_HEAVY, WK_UP_STRONG
+};
+static const uint8_t gtr_white_bit[16] = {
+    0, 2, 4, 6, 7, 9, 11, 12, 14, 16, 18, 19, 21, 23, 24, 26
+};
+
+/* ---- 状态 ---- */
+static void (*gtr_sink)(uint8_t, uint8_t, uint8_t);
+static int gtr_chord;                   /* 当前和弦 */
+static int gtr_alt_up;                  /* W7 连点交替标记 */
+static int gtr_alt_chord;               /* 交替状态隶属的和弦 */
+static uint32_t gtr_last_stroke_ms;     /* 交替重置计时 */
+static int gtr_seeded;
+static uint32_t gtr_prev_keys;
+static uint32_t gtr_now_ms;
+static char gtr_dbg[20];               /* 诊断回执（LCD 显示，宿主读取） */
+static int gtr_dbg_len;
+
+static void dbg_num(int v)             /* 写一个 0-99 的十进制数 */
+{
+    if (v < 0) { gtr_dbg[gtr_dbg_len++] = '-'; v = -v; }
+    if (v >= 10) gtr_dbg[gtr_dbg_len++] = (char)('0' + v / 10);
+    gtr_dbg[gtr_dbg_len++] = (char)('0' + v % 10);
+}
+
+const char *gtr_part_dbg(void)
+{
+    gtr_dbg[gtr_dbg_len] = 0;
+    gtr_dbg_len = 0;                   /* 读即清 */
+    gtr_dbg_len = 0;
+    return gtr_dbg;
+}
+
+/* ---- Note 队列 ---- */
+static struct gtr_note_q {
+    int used;
+    uint32_t at_ms;
+    uint8_t on, note, velocity;
+} gtr_nq[64];
+
+/* ---- 延迟扫弦队列（节奏型键的一小节排程）---- */
+static struct gtr_stroke_q {
+    int used;
+    uint32_t at_ms;
+    int stroke;
+} gtr_sq[16];
+
+static const int *gtr_current_chord(int *n)
+{
+    static const int dummy[1] = { 0 };
+    int i, count = 0;
+    for (i = 0; i < 4; i++) if (gtr_chords[gtr_chord][i]) count++;
+    if (count == 0) { *n = 1; return dummy; }
+    *n = count;
+    return gtr_chords[gtr_chord];
+}
+
+static void gtr_queue_note(uint32_t at, int on, int note, int vel)
+{
+    int slot;
+    for (slot = 0; slot < 64; slot++) {
+        if (gtr_nq[slot].used) continue;
+        gtr_nq[slot].used = 1;
+        gtr_nq[slot].at_ms = at;
+        gtr_nq[slot].on = on ? 1 : 0;
+        gtr_nq[slot].note = (uint8_t)note;
+        gtr_nq[slot].velocity = (uint8_t)vel;
+        return;
+    }                                  /* 队列满：丢弃（MVP） */
+}
+
+static void gtr_emit_v(int stroke_id, int vel_high, int vel_low)
+{
+    const int *chord; int n = 0, i;
+    struct gtr_strum_opts opts;
+    struct gtr_event ev[GTR_MAX_EVENTS];
+    int len = 0;
+
+    chord = gtr_current_chord(&n);
+    memset(&opts, 0, sizeof opts);
+    opts.pattern_id = stroke_id;
+    opts.spread = 0.065;   /* 65ms：可闻的扫弦感 */
+    opts.gate = 0.4;       /* 0.4s：快速释放发声位，防声音被挤掉 */
+    opts.velHigh = vel_high;
+    opts.velLow = vel_low;
+    if (gtr_strum(chord, n, &opts, ev, GTR_MAX_EVENTS, &len) != GTR_OK) {
+        gtr_dbg[gtr_dbg_len++] = 'E';
+        dbg_num(-GTR_E_INTERNAL);        /* 粗报：内部失败 */
+        return;
+    }
+    gtr_dbg[gtr_dbg_len++] = 'S';
+    dbg_num(len);
+    for (i = 0; i < len; i++) {
+        gtr_queue_note(gtr_now_ms + (uint32_t)(ev[i].tOn * 1000.0), 1,
+                       ev[i].note, ev[i].velocity);
+        gtr_queue_note(gtr_now_ms + (uint32_t)(ev[i].tOff * 1000.0), 0,
+                       ev[i].note, 0);
+    }
+}
+
+static void gtr_emit(int stroke_id)
+{
+    gtr_emit_v(stroke_id, 127, 100);   /* 成品力度：音量拉满，不会被淹没 */
+}
+
+int gtr_part_latch(void) { return 1; }          /* 常驻：兼容旧查询 */
+int gtr_part_active(void) { return 1; }
+
+void gtr_part_set_sink(void (*sink)(uint8_t, uint8_t, uint8_t))
+{
+    gtr_sink = sink;
+}
+
+void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
+                   uint32_t now_ms)
+{
+    uint32_t rose = current_keys & ~previous_keys;
+    int w, chord_changed = (gtr_chord != gtr_alt_chord);
+
+    gtr_now_ms = now_ms;
+    if (!gtr_seeded) {
+        gtr_prev_keys = current_keys;
+        gtr_alt_chord = gtr_chord;
+        gtr_seeded = 1;
+        return;
+    }
+    /* 交替状态重置：换和弦或停 2 秒 */
+    if (chord_changed || (uint32_t)(now_ms - gtr_last_stroke_ms) > 2000u)
+        gtr_alt_up = 0;
+
+    /* 黑键 = 选和弦 + 轻扫确认 */
+    for (w = 0; w < GTR_CHORD_N; w++) {
+        if (rose & gtr_chord_bits[w]) {
+            gtr_chord = w;
+            gtr_alt_chord = w;
+            gtr_alt_up = 0;
+            gtr_dbg[gtr_dbg_len++] = 'B';
+            dbg_num(w);
+            gtr_dbg[gtr_dbg_len++] = ' ';
+            gtr_emit_v(GTR_STROKE_DOWN, 127, 90);  /* 确认：全力和弦，变化明确 */
+        }
+    }
+
+    /* 白键 = Ample 式扫弦面板 */
+    for (w = 0; w < 16; w++) {
+        uint32_t mask = 1u << gtr_white_bit[w];
+        if (!(rose & mask)) continue;
+        gtr_dbg[gtr_dbg_len++] = 'W';
+        dbg_num(w);
+        gtr_dbg[gtr_dbg_len++] = ' ';
+        switch (gtr_white_type[w]) {
+        case WK_PLUCK6: case WK_PLUCK5: case WK_PLUCK4:
+        case WK_PLUCK3: case WK_PLUCK2: case WK_PLUCK1: {
+            const int *chord; int cn = 0;
+            int idx = WK_PLUCK1 - gtr_white_type[w];   /* 0=最低弦 */
+            int clamped, vel = 120;
+            struct gtr_event pe;
+            chord = gtr_current_chord(&cn);
+            clamped = idx < cn ? idx : cn - 1;
+            if (gtr_pluck(chord, cn, clamped, vel, &pe) == GTR_OK) {
+                gtr_queue_note(gtr_now_ms, 1, pe.note, pe.velocity);
+                gtr_queue_note(gtr_now_ms + 500u, 0, pe.note, 0);
+            }
+            break;
+        }
+        case WK_DOWN_ALT:
+            gtr_emit_v(gtr_alt_up ? GTR_STROKE_UP : GTR_STROKE_DOWN, 0, 0);
+            gtr_alt_up = !gtr_alt_up;
+            gtr_last_stroke_ms = now_ms;
+            break;
+        case WK_DOWN_MUTE: gtr_emit(GTR_STROKE_CHUCK); gtr_last_stroke_ms = now_ms; break;
+        case WK_UP:        gtr_emit(GTR_STROKE_UP);    gtr_last_stroke_ms = now_ms; break;
+        case WK_PALM:      gtr_emit_v(GTR_STROKE_DOWN, 80, 55); gtr_last_stroke_ms = now_ms; break;
+        case WK_HEAVY:     gtr_emit_v(GTR_STROKE_DOWN, 127, 100); gtr_last_stroke_ms = now_ms; break;
+        case WK_UP_STRONG: gtr_emit_v(GTR_STROKE_UP, 112, 80);  gtr_last_stroke_ms = now_ms; break;
+        default: break;
+        }
+    }
+    gtr_prev_keys = current_keys;
+}
+
+/* 节奏型键：排程一小节的扫弦（延迟队列，tick 到点逐刷下发） */
+static void gtr_schedule_bar(int rhythm_id)
+{
+    struct gtr_stroke_sched sched[GTR_MAX_STEPS];
+    int len = 0, i, slot;
+    if (gtr_expand_rhythm(rhythm_id, NULL, 2.0, sched, GTR_MAX_STEPS, &len) != GTR_OK)
+        return;
+    for (i = 0; i < len; i++) {
+        for (slot = 0; slot < 16; slot++) {
+            if (gtr_sq[slot].used) continue;
+            gtr_sq[slot].used = 1;
+            gtr_sq[slot].at_ms = gtr_now_ms + (uint32_t)(sched[i].at * 1000.0);
+            gtr_sq[slot].stroke = sched[i].stroke;
+            break;
+        }
+    }
+}
+
+void gtr_part_tick(uint32_t now_ms)
+{
+    int slot;
+    gtr_now_ms = now_ms;       /* 修复：时钟每次 tick 刷新（原冻结在最后按键时刻，
+                                  导致节奏型键的整小节排程沉没） */
+    if (!gtr_sink) return;
+    /* 到期的延迟扫弦 → 立即展开成音符入队 */
+    for (slot = 0; slot < 16; slot++) {
+        if (!gtr_sq[slot].used) continue;
+        if ((int32_t)(now_ms - gtr_sq[slot].at_ms) < 0) continue;
+        gtr_emit(gtr_sq[slot].stroke);
+        gtr_sq[slot].used = 0;
+    }
+    /* 到期的 Note On/Off */
+    for (slot = 0; slot < 64; slot++) {
+        if (!gtr_nq[slot].used) continue;
+        if ((int32_t)(now_ms - gtr_nq[slot].at_ms) < 0) continue;
+        if (gtr_nq[slot].on)
+            gtr_sink(0x90, gtr_nq[slot].note, gtr_nq[slot].velocity);
+        else
+            gtr_sink(0x80, gtr_nq[slot].note, 0);
+        gtr_nq[slot].used = 0;
+    }
+}
