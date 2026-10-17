@@ -40,6 +40,7 @@ static const int gtr_chords[GTR_CHORD_N][6] = {
     { 45, 52, 55, 61, 64, 69 },   /* 10 A7  开放 x02020 加高音 */
 };
 #define GTR_CHORD_NOTES 6
+#define GTR_SEQ_MASK   ((1u << 18) | (1u << 19) | (1u << 21) | (1u << 23))   /* W11-14 节奏型键 */
 
 /* ---- 白键功能表（按官方 white_keys[16] 顺序）---- */
 enum {
@@ -68,6 +69,8 @@ static uint32_t gtr_last_stroke_ms;     /* 交替重置计时 */
 static int gtr_seeded;
 static uint32_t gtr_prev_keys;
 static uint32_t gtr_now_ms;
+static int gtr_seq_rhythm = -1;        /* 按住中的节奏型（-1 = 无） */
+static int gtr_seq_held;               /* 节奏型键是否仍按住 */
 static char gtr_dbg[20];               /* 诊断回执（LCD 显示，宿主读取） */
 static int gtr_dbg_len;
 
@@ -205,7 +208,7 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
         case WK_PLUCK6: case WK_PLUCK5: case WK_PLUCK4:
         case WK_PLUCK3: case WK_PLUCK2: case WK_PLUCK1: {
             const int *chord; int cn = 0;
-            int idx = WK_PLUCK1 - gtr_white_type[w];   /* 0=最低弦 */
+            int idx = gtr_white_type[w];   /* 左→右 = 低→高（钢琴逻辑） */
             int vel = 120;
             struct gtr_event pe;
             chord = gtr_current_chord(&cn);
@@ -223,15 +226,19 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
         case WK_DOWN_MUTE: gtr_emit(GTR_STROKE_CHUCK); gtr_last_stroke_ms = now_ms; break;
         case WK_UP:        gtr_emit(GTR_STROKE_UP);    gtr_last_stroke_ms = now_ms; break;
         case WK_PALM:      gtr_emit_v(GTR_STROKE_DOWN, 80, 55); gtr_last_stroke_ms = now_ms; break;
-        case WK_SEQ_FOLK:   gtr_schedule_bar(GTR_RHYTHM_FOLK);   break;
-        case WK_SEQ_POP:    gtr_schedule_bar(GTR_RHYTHM_POP);    break;
-        case WK_SEQ_PUNK:   gtr_schedule_bar(GTR_RHYTHM_PUNK);   break;
-        case WK_SEQ_REGGAE: gtr_schedule_bar(GTR_RHYTHM_REGGAE); break;
+        case WK_SEQ_FOLK:   gtr_seq_rhythm = GTR_RHYTHM_FOLK;   break;
+        case WK_SEQ_POP:    gtr_seq_rhythm = GTR_RHYTHM_POP;    break;
+        case WK_SEQ_PUNK:   gtr_seq_rhythm = GTR_RHYTHM_PUNK;   break;
+        case WK_SEQ_REGGAE: gtr_seq_rhythm = GTR_RHYTHM_REGGAE; break;
         case WK_HEAVY:     gtr_emit_v(GTR_STROKE_DOWN, 127, 100); gtr_last_stroke_ms = now_ms; break;
         case WK_UP_STRONG: gtr_emit_v(GTR_STROKE_UP, 112, 80);  gtr_last_stroke_ms = now_ms; break;
         default: break;
         }
     }
+    /* 节奏型键：按下立即起一小节；按住持续循环（tick 续排），松手当前小节收尾 */
+    gtr_seq_held = (current_keys & GTR_SEQ_MASK) != 0;
+    if (gtr_seq_rhythm >= 0 && (rose & GTR_SEQ_MASK) && !gtr_seq_held)
+        gtr_seq_rhythm = -1;
     gtr_prev_keys = current_keys;
 }
 
@@ -265,6 +272,12 @@ void gtr_part_tick(uint32_t now_ms)
         if ((int32_t)(now_ms - gtr_sq[slot].at_ms) < 0) continue;
         gtr_emit(gtr_sq[slot].stroke);
         gtr_sq[slot].used = 0;
+    }
+    /* 按住节奏型键 → 当前小节弹完自动续下一小节（循环） */
+    if (gtr_seq_held && gtr_seq_rhythm >= 0) {
+        int any = 0;
+        for (slot = 0; slot < 16; slot++) if (gtr_sq[slot].used) { any = 1; break; }
+        if (!any) gtr_schedule_bar(gtr_seq_rhythm);
     }
     /* 到期的 Note On/Off */
     for (slot = 0; slot < 64; slot++) {
