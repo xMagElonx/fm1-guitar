@@ -166,8 +166,23 @@ int fm1_midi_post(const uint8_t *data, size_t bytes)
     memcpy(midi[midi_write].data, data, bytes); midi[midi_write].count = (uint8_t)bytes;
     midi_write = next; return 0;
 }
+/* ---- TX 探针：记录引擎输出的 note-on/off（排错用，无副作用） ---- */
+static struct { uint32_t ms; uint8_t st, d1, d2; } tx_log[512];
+static unsigned tx_len;
+EXPORT("sim_tx_reset") void sim_tx_reset(void) { tx_len = 0; }
+EXPORT("sim_tx_len") unsigned sim_tx_len(void) { return tx_len; }
+EXPORT("sim_tx_log") const void *sim_tx_log(void) { return tx_log; }
+
 static void send(const uint8_t *data, unsigned bytes)
-{ fm1_web_midi(data, bytes); }
+{
+    if (bytes == 3 && tx_len < 512 && (data[0] & 0xf0) == 0x90)
+    {
+        tx_log[tx_len].ms = now_ms;
+        tx_log[tx_len].st = data[0]; tx_log[tx_len].d1 = data[1]; tx_log[tx_len].d2 = data[2];
+        ++tx_len;
+    }
+    fm1_web_midi(data, bytes);
+}
 EXPORT("sim_boot") void sim_boot(unsigned clear)
 {
     /* Bit 0 clears storage; bit 1 previews the device startup animation. */

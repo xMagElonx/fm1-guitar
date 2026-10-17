@@ -137,6 +137,28 @@ static void gtr_queue_note(uint32_t at, int on, int note, int vel)
     }                                  /* 队列满：丢弃（MVP） */
 }
 
+/* 每根弦当前鸣响的音高（0 = 无）。合成器对仍在发声的音高不响应重复
+   note-on（B1.6.2 实测），扫弦/拨弦前必须先补 off 才能重新触发。 */
+static uint8_t gtr_held[GTR_CHORD_NOTES];
+
+static void gtr_retrigger_prepare(void)
+{
+    int slot, j;
+    /* 1) 取消上一扫尚未下发的 gate off —— 否则它会落到本扫的 on 之后，
+          把本扫刚按响的音拦腰截断（punk 250ms 间隔 < gate 400ms 必现） */
+    for (slot = 0; slot < 64; slot++) {
+        if (!gtr_nq[slot].used || gtr_nq[slot].on) continue;
+        for (j = 0; j < GTR_CHORD_NOTES; j++)
+            if (gtr_held[j] && gtr_nq[slot].note == gtr_held[j]) {
+                gtr_nq[slot].used = 0;
+                break;
+            }
+    }
+    /* 2) 立即 off 上一扫仍在鸣响的音（先 off 后 on，合成器才会重新出音头） */
+    for (j = 0; j < GTR_CHORD_NOTES; j++)
+        if (gtr_held[j]) gtr_queue_note(gtr_now_ms, 0, gtr_held[j], 0);
+}
+
 static void gtr_emit_v(int stroke_id, int vel_high, int vel_low)
 {
     const int *chord; int n = 0, i;
@@ -148,7 +170,7 @@ static void gtr_emit_v(int stroke_id, int vel_high, int vel_low)
     memset(&opts, 0, sizeof opts);
     opts.pattern_id = stroke_id;
     opts.spread = 0.065;   /* 65ms：可闻的扫弦感 */
-    opts.gate = 0.4;       /* 0.4s：快速释放发声位，防声音被挤掉 */
+    opts.gate = 0.4;       /* 0.4s：单扫的余音长度（循环扫弦由重触发接管） */
     opts.velHigh = vel_high;
     opts.velLow = vel_low;
     if (gtr_strum(chord, n, &opts, ev, GTR_MAX_EVENTS, &len) != GTR_OK) {
@@ -158,12 +180,16 @@ static void gtr_emit_v(int stroke_id, int vel_high, int vel_low)
     }
     dbg_put('S');
     dbg_num(len);
+    gtr_retrigger_prepare();
     for (i = 0; i < len; i++) {
         gtr_queue_note(gtr_now_ms + (uint32_t)(ev[i].tOn * 1000.0), 1,
                        ev[i].note, ev[i].velocity);
         gtr_queue_note(gtr_now_ms + (uint32_t)(ev[i].tOff * 1000.0), 0,
                        ev[i].note, 0);
     }
+    memset(gtr_held, 0, sizeof gtr_held);
+    for (i = 0; i < len; i++)
+        gtr_held[ev[i].string % GTR_CHORD_NOTES] = (uint8_t)ev[i].note;
 }
 
 static void gtr_emit(int stroke_id)
@@ -223,8 +249,19 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
             struct gtr_event pe;
             chord = gtr_current_chord(&cn);
             if (gtr_pluck(chord, cn, idx, vel, &pe) == GTR_OK) {
+                if (gtr_held[idx]) {       /* 同弦连拨：先 off 才能重触发 */
+                    int slot2;
+                    for (slot2 = 0; slot2 < 64; slot2++)
+                        if (gtr_nq[slot2].used && !gtr_nq[slot2].on &&
+                            gtr_nq[slot2].note == gtr_held[idx]) {
+                            gtr_nq[slot2].used = 0;
+                            break;
+                        }
+                    gtr_queue_note(gtr_now_ms, 0, gtr_held[idx], 0);
+                }
                 gtr_queue_note(gtr_now_ms, 1, pe.note, pe.velocity);
                 gtr_queue_note(gtr_now_ms + 500u, 0, pe.note, 0);
+                gtr_held[idx] = (uint8_t)pe.note;
             }
             break;
         }
@@ -255,15 +292,9 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
 /* 节奏型键：排程一小节的扫弦（延迟队列，tick 到点逐刷下发） */
 static void gtr_schedule_bar(int rhythm_id)
 {
-#ifdef FM1_OPEN_WEB
-    fprintf(stderr, "[SB] enter id=%d\n", rhythm_id);
-#endif
     struct gtr_stroke_sched sched[GTR_MAX_STEPS];
     int len = 0, i, slot;
     int erc = gtr_expand_rhythm(rhythm_id, NULL, 2.0, sched, GTR_MAX_STEPS, &len);
-#ifdef FM1_OPEN_WEB
-    fprintf(stderr, "[SB] expand rc=%d len=%d\n", erc, len);
-#endif
     if (erc != GTR_OK)
         return;
     for (i = 0; i < len; i++) {

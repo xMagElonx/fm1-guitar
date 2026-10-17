@@ -63,12 +63,54 @@ inst = new WebAssembly.Instance(mod, io);
 const c = inst.exports;
 const FR = c.sim_block_frames();
 
+const CH = { F: 1, C: 3, G: 5, Dm: 8, Am: 10 };
+const SEQ_FOLK = 18, SEQ_PUNK = 21, W_STRUM = 11, W_UP = 14;
+// —— 回归 B1.6.2：循环扫弦的每次下扫都必须有新音头 ——
+// 针对的真实 bug：FM1 合成器对仍在发声的音高不响应重复 note-on。
+// 旧 gate(0.4s) 的 off 排在 250ms 后下一扫 on 之后 → punk 8 连扫只有
+// 第一扫（和换和弦那一扫）出声，用户听到「只响两下」。
+// 修复：gtr_emit_v 先补 off 再 on（gtr_retrigger_prepare）。
+// 判定：punk 按住 2.4s（含中途换和弦），音频包络的攻击数 ≥ 8。
+{
+  c.sim_boot(0);
+  for (let b = 0; b < 60; b++) c.sim_render();
+  c.sim_factory_project(5);
+  const proj2 = new Uint8Array(c.memory.buffer, c.sim_file(), 4064).slice();
+  new Uint8Array(c.memory.buffer, c.sim_file(), 4064).set(proj2);
+  c.sim_import(4064);
+  for (let b = 0; b < 40; b++) c.sim_render();
+  const pev = [[1.0, SEQ_PUNK, 1], [1.2, CH.F, 1], [1.35, CH.F, 0], [3.4, SEQ_PUNK, 0]];
+  let pi = 0;
+  const audio = [];
+  const ptotal = Math.ceil(5.5 * 44100 / FR);
+  for (let b = 0; b < ptotal; b++) {
+    const nowMs = b * FR * 1000 / 44100;
+    while (pi < pev.length && pev[pi][0] * 1000 <= nowMs) { const e = pev[pi++]; c.sim_control(1, e[1], e[2]); }
+    const p = c.sim_render();
+    const m = new Float32Array(c.memory.buffer, p, FR * 2);
+    for (let i = 0; i < FR; i++) audio.push(m[i * 2]);   // 左声道
+  }
+  const win = Math.floor(44100 * 0.01);
+  let mx = 0; const env = [];
+  for (let i = 0; i + win < audio.length; i += win) {
+    let s = 0;
+    for (let j = 0; j < win; j++) { const v = audio[i + j]; s += v * v; }
+    const e = Math.sqrt(s / win); env.push(e); if (e > mx) mx = e;
+  }
+  let attacks = 0;
+  for (let i = 2; i < env.length; i++) {
+    const th = Math.max(mx * 0.15, 0.002);
+    const prev = Math.max(env[i - 2], 1e-5);
+    if (env[i] > th && env[i] > prev * 1.6) { attacks++; i += 1; }
+  }
+  check('punk 循环每扫有音头（攻击数≥8，实测 ' + attacks + '）', attacks >= 8,
+    '音频峰值=' + mx.toFixed(4) + '（峰值≈0 说明 reboot 后引擎没出声）');
+}
+
 console.log('stress_gtr: 60 秒长跑（folk 循环 + 循环中换和弦 + 连续扫弦）');
 
 // —— 场景：0.5s 起按住 folk，期间每 2 秒换和弦，10s 后叠 punk（覆盖两键互踩），
 //    20s 释放 punk，30s 释放 folk，35-50s 连续单扫，全程监听 MIDI 输出 ——
-const CH = { F: 1, C: 3, G: 5, Dm: 8, Am: 10 };
-const SEQ_FOLK = 18, SEQ_PUNK = 21, W_STRUM = 11, W_UP = 14;
 const ev = [];
 const kd = (t, bit) => ev.push({ t, bit, d: 1 });
 const ku = (t, bit) => ev.push({ t, bit, d: 0 });
@@ -119,6 +161,7 @@ try {
   stillAlive = energy > 0;
 } catch (e) { stillAlive = false; }
 check('长跑后引擎仍能出声', stillAlive);
+
 
 console.log(`\nstress_gtr: ${ok} 过, ${fail} 败`);
 process.exit(fail ? 1 : 0);
