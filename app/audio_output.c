@@ -4,14 +4,6 @@
 #include "fm1_audio_io.h"
 
 static unsigned output_gain;
-
-#ifdef FM1_OPEN_WEB
-/* 诊断导出：无头验证输出音量门（B1.3 调试用，定位后移除） */
-__attribute__((export_name("sim_output_gain"))) unsigned sim_output_gain(void)
-{
-    return output_gain;
-}
-#endif
 static int32_t usb_pcm[FM1_BLOCK_WORDS] __attribute__((aligned(32)));
 static int16_t bluetooth_pcm[FM1_BLOCK_WORDS] __attribute__((aligned(32)));
 

@@ -205,7 +205,6 @@ static uint8_t operator_page[GROOVE_TRACKS][8], operator_selected[GROOVE_TRACKS]
 static uint8_t tone_pages[GROOVE_TRACKS][GROOVE_PADS + 1], drum_parts[GROOVE_TRACKS];
 static uint32_t operator_time[6], operator_held, operator_long;
 static uint8_t key_note[27], key_track[27], retry_reset;
-static uint8_t gtr_boot_notice_done;
 static uint32_t previous_buttons, previous_keys, blocked_keys, frame_ms, glo_ms;
 static uint32_t encoder_time[7];
 static int8_t encoder_direction[7];
@@ -1812,14 +1811,13 @@ static int apply_controls(const struct fm1_controls *controls, uint32_t now,
     unsigned play_handled = 0;
     previous_buttons = controls->buttons;
     previous_keys = controls->keys;
-    /* B1 吉他语义部件：吉他交互常驻（详见 app/gtr_part.c）。 */
+    /* B1 吉他语义部件：ENV 按住 + OVERVIEW 页时接管音名键（详见 app/gtr_part.c）。 */
     gtr_part_set_sink(gtr_post_sink);
-    gtr_part_keys(old_keys, controls->keys, now);
-    if (!gtr_boot_notice_done) {               /* 开机自报版本：LCD 显示 4 秒 */
-        gtr_boot_notice_done = 1;
-        notice = "GTR B1.7 READY / BLACK=CHORD WHITE=STRUM";
-        notice_until = now + 4000U;
+    if (key_down) {                            /* 诊断探针：输入到达闪现 */
+        notice = "INPUT OK";
+        notice_until = now + 400U;
     }
+    gtr_part_keys(old_keys, controls->keys, now);   /* B1.2：吉他交互常驻 */
     blocked_keys &= controls->keys;
     if (pressed || encoder_active(controls->encoders)) notice = NULL;
     if (retry_reset) {
