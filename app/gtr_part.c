@@ -19,6 +19,7 @@
 #include "gtr_sem.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #define GTR_CHORD_N   11
 static const uint32_t gtr_chord_bits[GTR_CHORD_N] = {
@@ -76,15 +77,26 @@ static uint32_t gtr_bar_len_ms = 2000; /* 小节时长（barSec 2.0s） */
 static char gtr_dbg[20];               /* 诊断回执（LCD 显示，宿主读取） */
 static int gtr_dbg_len;
 
+static void dbg_put(char c)            /* 越界保护：写满即丢，绝不越过缓冲区
+                                          （P1 修复：gtr_part_dbg 无人调用时
+                                          gtr_dbg_len 无限增长，写穿静态区，
+                                          最终 wasm 越界硬崩 / 真机内存损坏） */
+{
+    if (gtr_dbg_len < (int)sizeof(gtr_dbg) - 1)
+        gtr_dbg[gtr_dbg_len++] = c;
+}
+
 static void dbg_num(int v)             /* 写一个 0-99 的十进制数 */
 {
-    if (v < 0) { gtr_dbg[gtr_dbg_len++] = '-'; v = -v; }
-    if (v >= 10) gtr_dbg[gtr_dbg_len++] = (char)('0' + v / 10);
-    gtr_dbg[gtr_dbg_len++] = (char)('0' + v % 10);
+    if (v < 0) { dbg_put('-'); v = -v; }
+    if (v >= 10) dbg_put((char)('0' + v / 10));
+    dbg_put((char)('0' + v % 10));
 }
 
 const char *gtr_part_dbg(void)
 {
+    if (gtr_dbg_len > (int)sizeof(gtr_dbg) - 1)
+        gtr_dbg_len = (int)sizeof(gtr_dbg) - 1;
     gtr_dbg[gtr_dbg_len] = 0;
     gtr_dbg_len = 0;                   /* 读即清 */
     gtr_dbg_len = 0;
@@ -140,11 +152,11 @@ static void gtr_emit_v(int stroke_id, int vel_high, int vel_low)
     opts.velHigh = vel_high;
     opts.velLow = vel_low;
     if (gtr_strum(chord, n, &opts, ev, GTR_MAX_EVENTS, &len) != GTR_OK) {
-        gtr_dbg[gtr_dbg_len++] = 'E';
+        dbg_put('E');
         dbg_num(-GTR_E_INTERNAL);        /* 粗报：内部失败 */
         return;
     }
-    gtr_dbg[gtr_dbg_len++] = 'S';
+    dbg_put('S');
     dbg_num(len);
     for (i = 0; i < len; i++) {
         gtr_queue_note(gtr_now_ms + (uint32_t)(ev[i].tOn * 1000.0), 1,
@@ -199,9 +211,9 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
     for (w = 0; w < 16; w++) {
         uint32_t mask = 1u << gtr_white_bit[w];
         if (!(rose & mask)) continue;
-        gtr_dbg[gtr_dbg_len++] = 'W';
+        dbg_put('W');
         dbg_num(w);
-        gtr_dbg[gtr_dbg_len++] = ' ';
+        dbg_put(' ');
         switch (gtr_white_type[w]) {
         case WK_PLUCK6: case WK_PLUCK5: case WK_PLUCK4:
         case WK_PLUCK3: case WK_PLUCK2: case WK_PLUCK1: {
@@ -243,9 +255,16 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
 /* 节奏型键：排程一小节的扫弦（延迟队列，tick 到点逐刷下发） */
 static void gtr_schedule_bar(int rhythm_id)
 {
+#ifdef FM1_OPEN_WEB
+    fprintf(stderr, "[SB] enter id=%d\n", rhythm_id);
+#endif
     struct gtr_stroke_sched sched[GTR_MAX_STEPS];
     int len = 0, i, slot;
-    if (gtr_expand_rhythm(rhythm_id, NULL, 2.0, sched, GTR_MAX_STEPS, &len) != GTR_OK)
+    int erc = gtr_expand_rhythm(rhythm_id, NULL, 2.0, sched, GTR_MAX_STEPS, &len);
+#ifdef FM1_OPEN_WEB
+    fprintf(stderr, "[SB] expand rc=%d len=%d\n", erc, len);
+#endif
+    if (erc != GTR_OK)
         return;
     for (i = 0; i < len; i++) {
         for (slot = 0; slot < 16; slot++) {
