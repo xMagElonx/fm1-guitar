@@ -702,6 +702,11 @@ static FM1_DSP_CODE inline int demo_message(const uint8_t *m, size_t n, unsigned
     for (size_t i = 1; i < n; ++i) if (m[i] & 0x80u) return 0;
     return 1;
 }
+#ifdef FM1_OPEN_WEB
+unsigned dbg_render_peak;              /* 诊断：render() 输出峰值（无头验收用） */
+__attribute__((export_name("sim_dbg_render_peak"))) unsigned sim_dbg_render_peak(void)
+{ return dbg_render_peak; }
+#endif
 static FM1_DSP_CODE void midi(const uint8_t *m, size_t n)
 {
     if (!m || !n)
@@ -1047,6 +1052,13 @@ int fm1_engine_render(int32_t *output, unsigned frames)
 {
     if (!output || frames != FM1_BLOCK_FRAMES) return -1;
     render(output, frames);
+#ifdef FM1_OPEN_WEB
+    { int32_t peak = 0;
+      for (unsigned i = 0; i < frames * 2U; ++i)
+          if (output[i] > peak) peak = output[i];
+      dbg_render_peak = (unsigned)(peak > 0 ? peak : -peak > 0 ? (unsigned)(-peak) : 0);
+      if (peak < 0) dbg_render_peak = (unsigned)(-peak); }
+#endif
     groove_sequence_click(output, frames);
     render_capacity = 0;
     for (unsigned track = 0; track < GROOVE_TRACKS; ++track)
