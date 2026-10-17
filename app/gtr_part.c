@@ -2,7 +2,7 @@
    gtr_part.c · 吉他语义部件（B1.2：无模式常驻 + Ample 式白键面板）
    ----------------------------------------------------------------------------
    交互（用户拍板：不要模式开关，吉他交互常驻）：
-     · 黑键 11 个 = 选和弦（按下即记住 + 自动轻扫一声确认，耳朵知道选上了）；
+     · 黑键 11 个 = 静默选和弦（演奏中切换不打断音乐）；
      · 白键 16 个 = Ample 式扫弦面板（官方 white_keys[16] 权威顺序）：
          W1..W6   单弦拨弦（和弦 6→1 弦各一键）
          W7       下扫（连点自动下上交替 —— Ample 招牌机制；
@@ -71,6 +71,8 @@ static uint32_t gtr_prev_keys;
 static uint32_t gtr_now_ms;
 static int gtr_seq_rhythm = -1;        /* 按住中的节奏型（-1 = 无） */
 static int gtr_seq_held;               /* 节奏型键是否仍按住 */
+static uint32_t gtr_bar_end_ms;        /* 当前小节的结束时刻（续排的节拍网格） */
+static uint32_t gtr_bar_len_ms = 2000; /* 小节时长（barSec 2.0s） */
 static char gtr_dbg[20];               /* 诊断回执（LCD 显示，宿主读取） */
 static int gtr_dbg_len;
 
@@ -184,16 +186,12 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
     if (chord_changed || (uint32_t)(now_ms - gtr_last_stroke_ms) > 2000u)
         gtr_alt_up = 0;
 
-    /* 黑键 = 选和弦 + 轻扫确认 */
+    /* 黑键 = 静默选和弦 */
     for (w = 0; w < GTR_CHORD_N; w++) {
         if (rose & gtr_chord_bits[w]) {
-            gtr_chord = w;
+            gtr_chord = w;                 /* 静默选和弦：演奏中切换不打断音乐 */
             gtr_alt_chord = w;
             gtr_alt_up = 0;
-            gtr_dbg[gtr_dbg_len++] = 'B';
-            dbg_num(w);
-            gtr_dbg[gtr_dbg_len++] = ' ';
-            gtr_emit_v(GTR_STROKE_DOWN, 127, 90);  /* 确认：全力和弦，变化明确 */
         }
     }
 
@@ -258,6 +256,7 @@ static void gtr_schedule_bar(int rhythm_id)
             break;
         }
     }
+    gtr_bar_end_ms = gtr_now_ms + gtr_bar_len_ms;   /* 网格：按小节时长续排 */
 }
 
 void gtr_part_tick(uint32_t now_ms)
@@ -274,10 +273,11 @@ void gtr_part_tick(uint32_t now_ms)
         gtr_sq[slot].used = 0;
     }
     /* 按住节奏型键 → 当前小节弹完自动续下一小节（循环） */
-    if (gtr_seq_held && gtr_seq_rhythm >= 0) {
+    if (gtr_seq_held && gtr_seq_rhythm >= 0 &&
+        (int32_t)(now_ms - gtr_bar_end_ms) >= 0) {
         int any = 0;
         for (slot = 0; slot < 16; slot++) if (gtr_sq[slot].used) { any = 1; break; }
-        if (!any) gtr_schedule_bar(gtr_seq_rhythm);
+        if (!any) gtr_schedule_bar(gtr_seq_rhythm);   /* 小节到点且排空 → 续排 */
     }
     /* 到期的 Note On/Off */
     for (slot = 0; slot < 64; slot++) {
