@@ -25,19 +25,21 @@ static const uint32_t gtr_chord_bits[GTR_CHORD_N] = {
     1u << 1,  1u << 3,  1u << 5,  1u << 8,  1u << 10,
     1u << 13, 1u << 15, 1u << 17, 1u << 20, 1u << 22, 1u << 25
 };
-static const int gtr_chords[GTR_CHORD_N][4] = {
-    { 41, 45, 48, 0 },      /* 0  F  */
-    { 48, 52, 55, 0 },      /* 1  C  */
-    { 43, 47, 50, 55 },     /* 2  G  */
-    { 50, 53, 57, 0 },      /* 3  Dm */
-    { 45, 52, 57, 0 },      /* 4  Am */
-    { 52, 55, 59, 0 },      /* 5  Em */
-    { 43, 47, 50, 53 },     /* 6  G7 */
-    { 40, 44, 47, 50 },     /* 7  E7 */
-    { 50, 54, 57, 60 },     /* 8  D7 */
-    { 46, 50, 53, 0 },      /* 9  Bb */
-    { 45, 49, 52, 55 },     /* 10 A7 */
+/* 6 弦真实吉他把位（低→高），标准调弦 E2=40 A2=45 D3=50 G3=55 B3=59 E4=64 */
+static const int gtr_chords[GTR_CHORD_N][6] = {
+    { 41, 48, 53, 57, 60, 65 },   /* 0  F   大横按 1 品 */
+    { 48, 55, 60, 64, 67, 72 },   /* 1  C   大横按 8 品 */
+    { 43, 47, 50, 55, 59, 67 },   /* 2  G   开放 320003 */
+    { 50, 57, 62, 65, 69, 74 },   /* 3  Dm  大横按 5 品 */
+    { 45, 52, 57, 60, 64, 69 },   /* 4  Am  开放 x02210 加高音 */
+    { 40, 47, 52, 55, 59, 64 },   /* 5  Em  开放 022000 */
+    { 43, 47, 50, 55, 59, 65 },   /* 6  G7  开放 320001 */
+    { 40, 47, 50, 56, 59, 64 },   /* 7  E7  开放 020100 */
+    { 50, 57, 60, 66, 69, 74 },   /* 8  D7  带高音双 D */
+    { 46, 53, 58, 62, 65, 70 },   /* 9  Bb  大横按 6 品 */
+    { 45, 52, 55, 61, 64, 69 },   /* 10 A7  开放 x02020 加高音 */
 };
+#define GTR_CHORD_NOTES 6
 
 /* ---- 白键功能表（按官方 white_keys[16] 顺序）---- */
 enum {
@@ -100,11 +102,7 @@ static struct gtr_stroke_q {
 
 static const int *gtr_current_chord(int *n)
 {
-    static const int dummy[1] = { 0 };
-    int i, count = 0;
-    for (i = 0; i < 4; i++) if (gtr_chords[gtr_chord][i]) count++;
-    if (count == 0) { *n = 1; return dummy; }
-    *n = count;
+    *n = GTR_CHORD_NOTES;
     return gtr_chords[gtr_chord];
 }
 
@@ -164,6 +162,8 @@ void gtr_part_set_sink(void (*sink)(uint8_t, uint8_t, uint8_t))
     gtr_sink = sink;
 }
 
+static void gtr_schedule_bar(int rhythm_id);   /* 前置声明：白键 switch 调用 */
+
 void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
                    uint32_t now_ms)
 {
@@ -206,11 +206,10 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
         case WK_PLUCK3: case WK_PLUCK2: case WK_PLUCK1: {
             const int *chord; int cn = 0;
             int idx = WK_PLUCK1 - gtr_white_type[w];   /* 0=最低弦 */
-            int clamped, vel = 120;
+            int vel = 120;
             struct gtr_event pe;
             chord = gtr_current_chord(&cn);
-            clamped = idx < cn ? idx : cn - 1;
-            if (gtr_pluck(chord, cn, clamped, vel, &pe) == GTR_OK) {
+            if (gtr_pluck(chord, cn, idx, vel, &pe) == GTR_OK) {
                 gtr_queue_note(gtr_now_ms, 1, pe.note, pe.velocity);
                 gtr_queue_note(gtr_now_ms + 500u, 0, pe.note, 0);
             }
@@ -224,6 +223,10 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
         case WK_DOWN_MUTE: gtr_emit(GTR_STROKE_CHUCK); gtr_last_stroke_ms = now_ms; break;
         case WK_UP:        gtr_emit(GTR_STROKE_UP);    gtr_last_stroke_ms = now_ms; break;
         case WK_PALM:      gtr_emit_v(GTR_STROKE_DOWN, 80, 55); gtr_last_stroke_ms = now_ms; break;
+        case WK_SEQ_FOLK:   gtr_schedule_bar(GTR_RHYTHM_FOLK);   break;
+        case WK_SEQ_POP:    gtr_schedule_bar(GTR_RHYTHM_POP);    break;
+        case WK_SEQ_PUNK:   gtr_schedule_bar(GTR_RHYTHM_PUNK);   break;
+        case WK_SEQ_REGGAE: gtr_schedule_bar(GTR_RHYTHM_REGGAE); break;
         case WK_HEAVY:     gtr_emit_v(GTR_STROKE_DOWN, 127, 100); gtr_last_stroke_ms = now_ms; break;
         case WK_UP_STRONG: gtr_emit_v(GTR_STROKE_UP, 112, 80);  gtr_last_stroke_ms = now_ms; break;
         default: break;
