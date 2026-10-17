@@ -8,8 +8,9 @@
 // 前置缺失（如 wasm 不存在）→ 大声 SKIP 并说明怎么补，不给假通过。
 
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-const WASM = process.argv[2] || new URL('../build/web/simulator.wasm', 'import.meta.url').pathname.replace(/^\/([A-Za-z]:)/, '$1');
+const WASM = process.argv[2] || fileURLToPath(new URL('../build/web/simulator.wasm', import.meta.url));
 let ok = 0, fail = 0, skip = 0;
 function check(name, cond, detail) {
   if (cond) { ok++; console.log('  ok  ' + name); }
@@ -110,7 +111,7 @@ try {
   let energy = 0;
   for (let b = 0; b < 40; b++) {
     const p = c.sim_render();
-    const m = new Float32Array(c.memory.buffer, p * 4, FR * 2);
+    const m = new Float32Array(c.memory.buffer, p, FR * 2);
     for (let i = 0; i < FR * 2; i++) energy += Math.abs(m[i]);
   }
   c.sim_control(1, W_STRUM, 0);
