@@ -1,31 +1,51 @@
-# FM1 Open V12
+# FM-1 Open Guitar · FM-1 pocket guitar firmware
 
-English · [简体中文](README.zh-CN.md)
+**EN** | [中文](README.zh-CN.md)
 
-8 tracks, 8 sample slots, 16 FX demos; SDK included.
+A guitar-strumming firmware layer for the [M-VAVE FM-1](https://www.m-vave.com/product.html?id=fm-1)
+pocket FM synthesizer, built on top of M-VAVE's official open-source firmware
+[m-vave/fm1_open](https://github.com/m-vave/fm1_open) (GPL-3.0).
 
-[Workbench and development kit](https://open.m-vave.com/fm1-workbench) · [Official forum](https://forum.m-vave.com)
+The 27-key keyboard becomes a **guitar playing surface**:
 
-Select "Source + SDK" in the workbench to download the development kit matching the online release.
+- **11 black keys** = chords (F C G Dm Am Em G7 E7 D7 Bb A7), selected silently while playing
+- **White keys 1–6** = single-string plucks (real guitar voicings, low → high, piano logic)
+- **White key 7** = strum with automatic down/up alternation on repeated taps
+- **White keys 8–10** = chuck / upstrum / palm mute
+- **White keys 11–14** = one full bar of folk / pop / punk / reggae, hold to keep looping
+- **White keys 15–16** = heavy down / strong up
+
+Strumming follows the industry-standard model (RealGuitar / Ample Sound): one voice per
+string, onsets spread across the pick direction, velocity decreasing along the stroke,
+mutes clamp the gate.
+
+## Try it / Download
+
+- **Browser demo** (runs the exact firmware): <https://fm1-tone-engine.app.workbuddy.host/>
+- **Firmware file**: `fm1-guitar-b1.6.fwsc` — flash over USB-C with any WebMIDI installer
+  (see the demo page for the flashing guide and risk notes).
 
 ## Build
 
-Requires Windows x64, PowerShell, `curl.exe` and `tar.exe`. Firmware builds also require the [JieLi PI32v2 clang 4.0.1 r3 compiler](https://doc.zh-jieli.com/Tools/zh-cn/dev_tools/dev_env/jl_toolchain.html); its folder must contain `bin/clang.exe`.
+Identical to upstream: `build.bat` on Windows x64 (the JieLi PI32v2 clang 4.0.1 toolchain,
+plus curl/tar). See [README-upstream.md](README-upstream.md). Note: `sdk/manifest.json`
+pins the exact toolchain file hashes (clang 4.0.1 r3); if your installed JieLi toolchain
+revision differs, the build tells you.
 
-Set `FM1_SOURCE_URL` to the HTTPS URL of this build's source archive, including its changes, license notices and build/install scripts. Web and package builds stop if it is missing.
+The guitar layer lives in `app/gtr_sem.{h,c}` (pure C99, no SDK includes, ported from a
+JavaScript reference implementation with a 52-assertion golden test suite) and
+`app/gtr_part.{h,c}` (panel wiring). Both are compiled automatically by the stock build.
 
-~~~powershell
-.\build.bat --web
-$env:FM1_PI32_TOOLCHAIN = 'C:\JL\pi32'
-.\build.bat --package
-~~~
+## License
 
-The web version builds from the included C sources. The first build downloads WASI SDK 27; set `FM1_WASI_SDK` to reuse an existing installation.
+Same as upstream: GPL-3.0-only with the FM1 SDK linking exception — see
+[LICENSE.md](LICENSE.md) and [THIRD_PARTY.md](THIRD_PARTY.md). The guitar semantic
+layer added by this fork is released under GPL-3.0. Hardware and upstream firmware
+copyright M-VAVE.
 
-Outputs: `build/preview/index.html` (preview), `build/dx7/generated/FM1_OFFICIAL_OPEN.fwsc` (firmware), `build/official-web/FM1-Official-Open-Source.html` (complete workbench).
+## Credits
 
-Hardware drivers are in `app/board/`. The audio interrupt calls `fm1_engine_render()`; `app/audio_output.c` handles USB/Bluetooth mixing and USB recording.
-
-APP: [GPLv3 with an SDK linking exception](LICENSE.md). The native engine is supplied as a binary; [SDK and third-party terms](THIRD_PARTY.md) apply separately.
-
-Back up projects and samples before flashing.
+- Upstream firmware: [m-vave/fm1_open](https://github.com/m-vave/fm1_open) by M-VAVE
+- Community lineage: Felucca (Hugelton Instruments), SLOOP, the FM-1 modding scene
+  ([FM-1 Resource Hub](https://github.com/aroum/fm1-custom-fw),
+  [awesome-fm-1](https://github.com/cicloid/awesome-fm-1))
