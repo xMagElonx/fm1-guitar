@@ -149,7 +149,7 @@ static void text(unsigned x, unsigned y, const char *s, unsigned scale, uint16_t
 }
 /* Eight tracks stay visible on HOME. SEQ maps the sixteen white keys to one
  * quarter of the 64-step pattern. All drawing and edits run on app_control. */
-enum { OVERVIEW, STEPS, FM_EDIT, FM_ENV, FM_LFO, TONE_EDIT, MIX, BLE, PROJECT, NAME, EFFECTS, SOURCE, ACTIONS, STEP_EDIT, RHYTHM, FM_QUICK, PRESET_BROWSER, ARP_EDIT, STARTUP, CHORDS };
+enum { OVERVIEW, STEPS, FM_EDIT, FM_ENV, FM_LFO, TONE_EDIT, MIX, BLE, PROJECT, NAME, EFFECTS, SOURCE, ACTIONS, STEP_EDIT, RHYTHM, FM_QUICK, PRESET_BROWSER, ARP_EDIT, STARTUP, CHORDS, STRUM };
 enum { OCT_DOWN, OCT_UP, FX, SCL, ENV, LFO, EDIT, GLO, HOME, SAVE, ARP, SEQ, PLAY, REC };
 #define BUTTON(b) (1U << (b))
 static const uint16_t colors[8] = {0x3c9f, 0x07bf, 0x4eae, 0x06d4, 0xac9f, 0xed18, 0xff06, 0xfba5};
@@ -176,7 +176,8 @@ static const char *const source_names[] = {"DX7 FM", "BASS 303", "DRUM 808", "PS
 static const char *const actions[] = {"STEP DETAILS", "RHYTHM / RECORD", "COPY STEP", "COPY PAGE", "COPY TRACK",
     "PASTE STEP", "PASTE PAGE", "PASTE TRACK", "CLEAR STEP", "CLEAR PAGE", "CLEAR TRACK",
     "REPEAT TO 32", "REPEAT TO 48", "REPEAT TO 64", "UNDO / REDO", "COPY TIMBRE", "PASTE TIMBRE",
-    "DX7 PATCH NAME", "BLUETOOTH / CLOCK", "STOP ALL / REWIND", "CHORD LIBRARY"};
+    "DX7 PATCH NAME", "BLUETOOTH / CLOCK", "STOP ALL / REWIND", "CHORD LIBRARY",
+    "STRUM EDITOR"};
 enum { ACTION_COUNT = sizeof actions / sizeof actions[0] };
 static unsigned source_preview, action, action_confirm, tone_clip_ready;
 static struct groove_preset tone_clip;
@@ -1203,6 +1204,13 @@ static void leds(const struct groove_view *v, unsigned visible)
                 bits |= 1U << white_keys[i];
         if (v->playing && (v->play_step & ~15U) == first)
             bits ^= 1U << white_keys[v->play_step & 15U];
+    } else if (visible == STRUM) {
+        /* 白键 16 个 = 16 步：有内容就亮；光标步闪烁。键灯没有亮度档，
+           闪烁是这里唯一能表达「光标」的手段。 */
+        for (unsigned i = 0; i < GTR_STRUM_STEPS; ++i)
+            if (gtr_part_strum_get((int)i) != GTR_STEP_REST)
+                bits |= 1U << white_keys[i];
+        if (blink) bits ^= 1U << white_keys[gtr_part_strum_cursor()];
     } else if (visible == PRESET_BROWSER) {
         bits = 1U << white_keys[preset_slot];
     } else if (visible == MIX) {
@@ -1242,7 +1250,7 @@ static void leds(const struct groove_view *v, unsigned visible)
         | ((visible == OVERVIEW) << HOME) | ((visible == EFFECTS) << FX)
         | ((groove_arp_enabled(track) != 0) << ARP)
         | ((visible == FM_EDIT && (fm_group == 4 || fm_group == 5)) << SCL)
-        | ((visible == STEPS || visible == ACTIONS || visible == STEP_EDIT || visible == RHYTHM) << SEQ)
+        | ((visible == STEPS || visible == ACTIONS || visible == STEP_EDIT || visible == RHYTHM || visible == STRUM) << SEQ)
         | ((writing != 0) << REC)
         | ((v->playing != 0) << PLAY) | ((visible == MIX) << GLO)
         | ((visible == FM_EDIT || visible == TONE_EDIT || visible == FM_QUICK || visible == STEP_EDIT) << EDIT)
@@ -1430,6 +1438,89 @@ static void chords_draw(void)
         text(8, 231, "BLACK KEY SELECT  K1/K2 EDIT", 1, DIM, BACK);
 }
 
+/* --------------------------------------------------------------------------
+   B2.0 STRUM 页：16 步 × 5 动作
+   布局照 steps()：4×4 网格、每格 53×25 像素。格内左上大号步号、右下动作
+   字母。底色编「类别」、字母编「方向」，两个维度分开编码 —— 先看色块分布
+   读出节奏骨架，再看字母读出具体手法。
+   键灯（见 leds）：白键亮 = 这步有内容；光标步闪烁 —— 键灯只有通断没有
+   亮度档，闪是基座 steps() 对播放头的既有解法。
+   -------------------------------------------------------------------------- */
+static uint32_t strum_sig;
+
+static uint16_t strum_color(int a)
+{
+    switch (a) {
+    case GTR_STEP_DOWN:  return colors[0];   /* 蓝   下扫 */
+    case GTR_STEP_UP:    return colors[3];   /* 青   上扫 */
+    case GTR_STEP_CHUCK: return AMBER;       /* 橙   切音 */
+    case GTR_STEP_MUTE:  return colors[4];   /* 紫   闷音 */
+    default:             return PANEL;       /* 深灰 休止 */
+    }
+}
+
+static const char *const strum_names[GTR_STEP_ACTIONS] = {"DOWN", "UP", "CHUCK", "MUTE", "REST"};
+static const char strum_letters[GTR_STEP_ACTIONS] = {'D', 'U', 'X', 'M', '-'};
+
+static void strum_draw(void)
+{
+    int cur = gtr_part_strum_cursor();
+    int i, count = 0, a;
+    uint32_t sig = 2166136261u;
+    char letter[2] = {'?', 0}, buf[12];
+
+    if (cur < 0 || cur >= GTR_STRUM_STEPS) cur = 0;
+    for (i = 0; i < GTR_STRUM_STEPS; ++i) {
+        a = gtr_part_strum_get(i);
+        if (a != GTR_STEP_REST) ++count;
+        sig = sig * 33u + (uint32_t)(a + 2);
+    }
+    sig = sig * 33u + (uint32_t)cur;
+    sig = sig * 33u + (uint32_t)(gtr_part_strum_stored() + 1);
+    sig = sig * 33u + (uint32_t)(uintptr_t)notice;
+    if (sig == strum_sig) return;
+    strum_sig = sig;
+
+    /* 基座 header() 已经把 0..29 画满了（它不认识 STRUM 页），这里整条清掉
+       再写自己的标题 —— 否则会出现「STOP 01/64 FOLLOW」压在标题上的重影。 */
+    paint_fill(0, 0, 240, 30, BACK);
+    text(8, 8, "STRUM", 2, ACCENT, BACK);
+    text(78, 13, gtr_part_strum_stored() ? "LIVE" : "EDIT", 1,
+         gtr_part_strum_stored() ? GREEN : AMBER, BACK);
+
+    for (i = 0; i < GTR_STRUM_STEPS; ++i) {
+        unsigned x = 8 + (unsigned)(i % 4) * 57;
+        unsigned y = 32 + (unsigned)(i / 4) * 34;
+        uint16_t bg, fg;
+        a = gtr_part_strum_get(i);
+        bg = strum_color(a);
+        fg = (a == GTR_STEP_REST) ? DIM : BACK;
+        paint_fill(x, y, 53, 25, bg);
+        if (i == cur) frame(x, y, 53, 25, TEXT);
+        number(x + 4, y + 4, (unsigned)(i + 1), 2, 1, fg, bg);
+        letter[0] = (a >= 0 && a < GTR_STEP_ACTIONS) ? strum_letters[a] : '?';
+        text(x + 36, y + 13, letter, 1, fg, bg);
+    }
+
+    /* 选中步一行详情 */
+    a = gtr_part_strum_get(cur);
+    if (a < 0 || a >= GTR_STEP_ACTIONS) a = GTR_STEP_REST;
+    text(8, 166, "STEP", 1, DIM, BACK);
+    number(38, 166, (unsigned)(cur + 1), 2, 1, ACCENT, BACK);
+    text(62, 166, strum_names[a], 1, strum_color(a), BACK);
+
+    decimal(buf, cur + 1, 1);
+    knob(0, "STEP", buf, colors[0]);
+    knob(1, "ACTION", strum_names[a], colors[1]);
+    decimal(buf, count, 1);
+    knob(2, "STROKES", buf, colors[2]);
+    knob(3, "METRE", "4/4", colors[3]);
+
+    paint_fill(0, 228, 240, 12, BACK);
+    text(8, 231, notice ? notice : "SAVE PLAY  HOME EXIT", 1,
+         notice ? TEXT : DIM, BACK);
+}
+
 static void draw_page_body(const struct fm1_ble_status *ble)
 {
     unsigned visible = boot_active ? STARTUP : glo_down && glo_used ? MIX : page;
@@ -1443,6 +1534,7 @@ static void draw_page_body(const struct fm1_ble_status *ble)
         memset(cache->cell_cache, 0xff, sizeof cache->cell_cache);
         memset(cache->tile_cache, 0xff, sizeof cache->tile_cache);
         memset(cache->meter_cache, 0xff, sizeof cache->meter_cache);
+        strum_sig = ~0U;   /* B2.0：整页重画，STRUM 页的局部签名作废 */
         if (visible == PROJECT || visible == PRESET_BROWSER)
             text(8, 8, visible == PROJECT ? "SAVE PROJECT" : "PRESETS", 2, ACCENT, BACK);
     }
@@ -1467,6 +1559,10 @@ static void draw_page_body(const struct fm1_ble_status *ble)
     header(v);
     if (visible == CHORDS) {
         chords_draw();
+        return;
+    }
+    if (visible == STRUM) {
+        strum_draw();
         return;
     }
     if (visible >= SOURCE) {
@@ -1886,11 +1982,16 @@ static int apply_controls(const struct fm1_controls *controls, uint32_t now,
     gtr_part_set_sink(gtr_post_sink);
     /* B1.6: 离开 CHORDS 页时关闭编辑模式（防止紧急停止/撤销等路径遗漏） */
     if (page != CHORDS) gtr_part_edit_mode(0);
+    /* B2.0: 离开 STRUM 页同样收掉，否则键盘会一直被编辑页接管 */
+    if (page != STRUM) gtr_part_strum_edit_mode(0);
     if (key_down) {                            /* 诊断探针：输入到达闪现 */
         notice = "INPUT OK";
         notice_until = now + 400U;
     }
-    gtr_part_keys(old_keys, controls->keys, now);   /* B1.2：吉他交互常驻 */
+    /* STRUM 页接管全部 27 个键（白键选步、黑键给动作）。这里传 0 而不是
+       跳过调用：让演奏层认为"全部松开"，退出该页时不会把编辑期间按过的
+       键算成新按下，从而突然扫出一串音。 */
+    gtr_part_keys(old_keys, page == STRUM ? 0u : controls->keys, now);   /* B1.2：吉他交互常驻 */
     blocked_keys &= controls->keys;
     if (pressed || encoder_active(controls->encoders)) notice = NULL;
     if (retry_reset) {
@@ -2024,6 +2125,59 @@ static int apply_controls(const struct fm1_controls *controls, uint32_t now,
         }
         if (pressed & BUTTON(HOME)) {
             gtr_part_edit_mode(0);
+            page = music_page;
+        }
+        goto controls_done;
+    }
+    /* STRUM page (B2.0)：16 白键 = 16 步，前 5 个黑键 = 5 种动作，
+       SAVE = 提交给演奏层并立即试听，HOME = 退出。 */
+    if (page == STRUM) {
+        static const uint8_t strum_black[5] = {1, 3, 5, 8, 10};  /* 一个八度内的 5 个黑键 */
+        uint32_t down = controls->keys & ~old_keys;
+        unsigned i;
+        gtr_part_strum_edit_mode(1);
+        for (i = 0; i < GTR_STRUM_STEPS; ++i) {
+            if (!(down & (1U << white_keys[i]))) continue;
+            /* 空步一按即激活（照 X0X 步进器）；有内容的步先选中，再按才改。 */
+            if (gtr_part_strum_get((int)i) == GTR_STEP_REST) {
+                gtr_part_strum_select((int)i);
+                if (gtr_part_strum_set((int)i, GTR_STEP_DOWN))
+                    gtr_part_strum_audition((int)i);
+            } else if (gtr_part_strum_cursor() == (int)i) {
+                if (gtr_part_strum_cycle((int)i))
+                    gtr_part_strum_audition((int)i);
+            } else {
+                gtr_part_strum_select((int)i);
+            }
+        }
+        for (i = 0; i < 5; ++i) {
+            if (!(down & (1U << strum_black[i]))) continue;
+            if (gtr_part_strum_set(gtr_part_strum_cursor(), (int)i))
+                gtr_part_strum_audition(gtr_part_strum_cursor());
+        }
+        if (down & (1U << 13)) {                 /* 第 8 个黑键：清空整小节 */
+            if (gtr_part_strum_clear()) {
+                notice = "PATTERN CLEARED";
+                notice_until = now + 1500U;
+            }
+        }
+        if (down & (1U << 15)) {                 /* 第 9 个黑键：试听整小节 */
+            if (gtr_part_strum_commit() == GTR_OK)
+                gtr_part_trigger_rhythm(GTR_RHYTHM_USER);
+        }
+        if (controls->encoders[0]) {
+            int step = (gtr_part_strum_cursor() + controls->encoders[0] + GTR_STRUM_STEPS)
+                       % GTR_STRUM_STEPS;
+            gtr_part_strum_select(step);
+        }
+        if (pressed & BUTTON(SAVE)) {
+            int rc = gtr_part_strum_commit();
+            notice = rc == GTR_OK ? "PATTERN LIVE" : "PATTERN REJECTED";
+            notice_until = now + 2000U;
+            if (rc == GTR_OK) gtr_part_trigger_rhythm(GTR_RHYTHM_USER);
+        }
+        if (pressed & BUTTON(HOME)) {
+            gtr_part_strum_edit_mode(0);
             page = music_page;
         }
         goto controls_done;
@@ -2208,6 +2362,7 @@ static int apply_controls(const struct fm1_controls *controls, uint32_t now,
                 memset(key_note, 0xff, sizeof key_note); writing = 0; page = OVERVIEW;
             }
             else if (action == 20) { page = CHORDS; gtr_part_edit_mode(1); }
+            else if (action == 21) { page = STRUM; gtr_part_strum_edit_mode(1); }
             notice = r == -3 ? "COPY MATCHING STEP / PAGE / TRACK FIRST"
                 : r == -2 ? "CHORD / LOCK TABLE FULL" : r ? "UNAVAILABLE / INCOMPATIBLE"
                 : operation == 2 ? "STEP COPIED - CHOOSE DESTINATION"

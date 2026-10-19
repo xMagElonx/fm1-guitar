@@ -75,4 +75,30 @@ void gtr_part_stop_rhythm(void);
 int  gtr_part_dropped_strokes(void);
 /* 诊断：排程时队列满而丢弃的击数，正常应恒为 0。 */
 
+/* ---- B2.0 扫弦节奏编辑器（STRUM 页）：16 步 × 5 动作 ----
+   16 步 = 4 拍 × 4 个十六分。每步一格、独立选动作；方向不按位置自动推断
+   （纯下拨的 punk 节奏物理上成立，摆臂法则会把它改错）。
+   动作码经 gtr_strum_note 唯一一处映射到引擎参数，界面/试听/播放同源。 */
+enum { GTR_STEP_DOWN  = 0,   /* 下扫 低→高，全弦 */
+       GTR_STEP_UP    = 1,   /* 上扫 高→低，高音 4 弦 */
+       GTR_STEP_CHUCK = 2,   /* 切音 哑音扫，gate 钳 0.07 */
+       GTR_STEP_MUTE  = 3,   /* 闷音 下扫 + palm_mute，gate 钳 0.14 */
+       GTR_STEP_REST  = 4,   /* 休止 不排程（= 空步） */
+       GTR_STEP_ACTIONS = 5 };
+#define GTR_STRUM_STEPS 16
+
+void gtr_part_strum_edit_mode(int on);      /* 1=进入 STRUM 页 0=退出 */
+int  gtr_part_strum_edit_active(void);
+int  gtr_part_strum_cursor(void);           /* 光标步 0-15 */
+int  gtr_part_strum_get(int step);          /* 动作码; 越界 -1 */
+int  gtr_part_strum_set(int step, int action);   /* 1=有改动 */
+int  gtr_part_strum_cycle(int step);        /* REST→D→U→X→M→REST */
+int  gtr_part_strum_select(int step);       /* 移光标; 1=动了 */
+int  gtr_part_strum_clear(void);            /* 全休止; 1=有改动 */
+int  gtr_part_strum_is_dirty(void);         /* 有未提交修改 */
+int  gtr_part_strum_stored(void);           /* 1=已提交给演奏层 */
+int  gtr_part_strum_commit(void);           /* 提交; GTR_OK 或 gtr_sem 错误码 */
+int  gtr_part_strum_audition(int step);     /* 单步试听; GTR_OK 或错误码 */
+
+
 #endif

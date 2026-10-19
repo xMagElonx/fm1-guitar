@@ -388,21 +388,17 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
     gtr_prev_keys = current_keys;
 }
 
-/* 节奏型键：排程一小节的扫弦（延迟队列，tick 到点逐刷下发）。
-   B1.9：rhythm_id == GTR_RHYTHM_USER 时把已存的自定义模式交给展开器。 */
-static void gtr_schedule_bar(int rhythm_id)
+/* 把一段模式排进延迟队列。bar_ms 是这段模式占的实际时长：整小节播放给
+   gtr_bar_len_ms，单步试听也给整小节（那一击落在 0ms）。
+   B2.0 从 gtr_schedule_bar 里拆出来，好让编辑器试听复用同一条排程路径 ——
+   试听走别的代码就等于没验证过真正的播放路径。 */
+static void gtr_schedule_pattern(int rhythm_id, const struct gtr_rhythm *cust,
+                                 uint32_t bar_ms)
 {
     struct gtr_stroke_sched sched[GTR_MAX_STEPS];
-    const struct gtr_rhythm *cust = NULL;
-    double bar_sec = (double)gtr_bar_len_ms / 1000.0;
     int len = 0, i, slot;
-    int erc;
-    if (rhythm_id == GTR_RHYTHM_USER) {
-        if (!gtr_user_ok) return;               /* 没存过模式 → 不出声 */
-        cust = &gtr_user_rhythm;
-    }
-    erc = gtr_expand_rhythm(rhythm_id, cust, bar_sec, sched, GTR_MAX_STEPS, &len);
-    if (erc != GTR_OK)
+    if (gtr_expand_rhythm(rhythm_id, cust, (double)bar_ms / 1000.0,
+                          sched, GTR_MAX_STEPS, &len) != GTR_OK)
         return;
     for (i = 0; i < len; i++) {
         for (slot = 0; slot < GTR_SQ_N; slot++) {
@@ -415,7 +411,19 @@ static void gtr_schedule_bar(int rhythm_id)
         }
         if (slot == GTR_SQ_N) gtr_sq_drops++;   /* 队列满：记数，不再静默丢弃 */
     }
-    gtr_bar_end_ms = gtr_now_ms + gtr_bar_len_ms;   /* 网格：按小节时长续排 */
+    gtr_bar_end_ms = gtr_now_ms + bar_ms;       /* 网格：按小节时长续排 */
+}
+
+/* 节奏型键：排程一小节的扫弦（延迟队列，tick 到点逐刷下发）。
+   B1.9：rhythm_id == GTR_RHYTHM_USER 时把已存的自定义模式交给展开器。 */
+static void gtr_schedule_bar(int rhythm_id)
+{
+    const struct gtr_rhythm *cust = NULL;
+    if (rhythm_id == GTR_RHYTHM_USER) {
+        if (!gtr_user_ok) return;               /* 没存过模式 → 不出声 */
+        cust = &gtr_user_rhythm;
+    }
+    gtr_schedule_pattern(rhythm_id, cust, gtr_bar_len_ms);
 }
 
 void gtr_part_tick(uint32_t now_ms)
@@ -610,4 +618,154 @@ void gtr_part_stop_rhythm(void)
 int gtr_part_dropped_strokes(void)
 {
     return gtr_sq_drops;
+}
+
+
+/* ==========================================================================
+   B2.0 扫弦节奏编辑器（STRUM 页）：16 步 × 5 动作
+   --------------------------------------------------------------------------
+   16 步 = 4 拍 × 4 个十六分，一步一格。走「十六格全自由」方案：每格独立
+   选动作，方向不按格子位置自动推断 —— 纯下拨的 punk 节奏在物理上完全成立，
+   任何「偶数格必是下扫」的摆臂法则都会把它改错。
+
+   动作码 → 引擎参数的映射只有一处（gtr_strum_note）。界面、单步试听、整
+   小节播放全部经过它，所以屏上显示什么就一定听到什么。
+
+   内存：16 字节编辑缓冲 + 3 个状态量，全部静态。落盘留给 M3（project
+   记录正好 4096 字节已填满，需要单独腾空间）。
+   ========================================================================== */
+
+#define GTR_STRUM_BEATS 4
+
+static uint8_t gtr_step_action[GTR_STRUM_STEPS] = {
+    GTR_STEP_REST, GTR_STEP_REST, GTR_STEP_REST, GTR_STEP_REST,
+    GTR_STEP_REST, GTR_STEP_REST, GTR_STEP_REST, GTR_STEP_REST,
+    GTR_STEP_REST, GTR_STEP_REST, GTR_STEP_REST, GTR_STEP_REST,
+    GTR_STEP_REST, GTR_STEP_REST, GTR_STEP_REST, GTR_STEP_REST
+};
+static int gtr_strum_cursor, gtr_strum_edit, gtr_strum_dirty, gtr_strum_stored;
+
+/* 动作码 → (stroke, palm_mute)。返回 0 = 这一步不出声（休止或非法码）。 */
+static int gtr_strum_note(int action, int *stroke, int *palm)
+{
+    switch (action) {
+    case GTR_STEP_DOWN:  *stroke = GTR_STROKE_DOWN;  *palm = 0; return 1;
+    case GTR_STEP_UP:    *stroke = GTR_STROKE_UP;    *palm = 0; return 1;
+    case GTR_STEP_CHUCK: *stroke = GTR_STROKE_CHUCK; *palm = 0; return 1;
+    case GTR_STEP_MUTE:  *stroke = GTR_STROKE_DOWN;  *palm = 1; return 1;
+    default:             return 0;
+    }
+}
+
+/* 16 步 → struct gtr_rhythm。beat 用 i*beats/steps 算，不写死 0.25：
+   将来换 8/32 步网格只改 GTR_STRUM_STEPS。 */
+static int gtr_strum_build(struct gtr_rhythm *r)
+{
+    int i, n = 0, stroke, palm;
+    r->beats = GTR_STRUM_BEATS;
+    for (i = 0; i < GTR_STRUM_STEPS; ++i) {
+        if (!gtr_strum_note(gtr_step_action[i], &stroke, &palm)) continue;
+        if (n >= GTR_MAX_STEPS) break;
+        r->steps[n].beat = (double)i * (double)GTR_STRUM_BEATS / (double)GTR_STRUM_STEPS;
+        r->steps[n].stroke = stroke;
+        r->steps[n].palm_mute = palm;
+        ++n;
+    }
+    r->n_steps = n;
+    return n;
+}
+
+void gtr_part_strum_edit_mode(int on)
+{
+    gtr_strum_edit = on ? 1 : 0;
+}
+
+int gtr_part_strum_edit_active(void) { return gtr_strum_edit; }
+int gtr_part_strum_cursor(void)      { return gtr_strum_cursor; }
+int gtr_part_strum_is_dirty(void)    { return gtr_strum_dirty; }
+int gtr_part_strum_stored(void)      { return gtr_strum_stored; }
+
+int gtr_part_strum_get(int step)
+{
+    if (step < 0 || step >= GTR_STRUM_STEPS) return -1;
+    return gtr_step_action[step];
+}
+
+int gtr_part_strum_set(int step, int action)
+{
+    if (step < 0 || step >= GTR_STRUM_STEPS) return 0;
+    if (action < 0 || action >= GTR_STEP_ACTIONS) return 0;
+    if (gtr_step_action[step] == (uint8_t)action) return 0;
+    gtr_step_action[step] = (uint8_t)action;
+    gtr_strum_dirty = 1;
+    gtr_strum_stored = 0;     /* 改过之后，RAM 里的模式不再等于编辑缓冲 */
+    return 1;
+}
+
+/* 白键连点循环：REST → D → U → X → M → REST。空步第一下就变成下扫，
+   跟 X0X 步进器「空步一按即激活」一致。 */
+int gtr_part_strum_cycle(int step)
+{
+    if (step < 0 || step >= GTR_STRUM_STEPS) return 0;
+    return gtr_part_strum_set(step, (gtr_step_action[step] + 1) % GTR_STEP_ACTIONS);
+}
+
+int gtr_part_strum_select(int step)
+{
+    if (step < 0 || step >= GTR_STRUM_STEPS) return 0;
+    if (gtr_strum_cursor == step) return 0;
+    gtr_strum_cursor = step;
+    return 1;
+}
+
+int gtr_part_strum_clear(void)
+{
+    int i, changed = 0;
+    for (i = 0; i < GTR_STRUM_STEPS; ++i)
+        if (gtr_step_action[i] != GTR_STEP_REST) {
+            gtr_step_action[i] = GTR_STEP_REST;
+            changed = 1;
+        }
+    if (changed) {
+        gtr_strum_dirty = 1;
+        gtr_strum_stored = 0;
+    }
+    return changed;
+}
+
+/* 提交编辑缓冲 → 演奏层。全休止等于「撤掉自定义模式」，退回内置节奏型。 */
+int gtr_part_strum_commit(void)
+{
+    struct gtr_rhythm r;
+    int rc;
+    memset(&r, 0, sizeof r);
+    if (gtr_strum_build(&r) == 0) {
+        gtr_user_ok = 0;
+        gtr_strum_stored = 0;
+        gtr_strum_dirty = 0;
+        return GTR_OK;
+    }
+    rc = gtr_part_set_user_rhythm(&r);
+    if (rc == GTR_OK) {
+        gtr_strum_stored = 1;
+        gtr_strum_dirty = 0;
+    }
+    return rc;
+}
+
+/* 单步试听：把这一击当成「1 拍 1 步」的最小模式排出去。
+   特意不去动 gtr_user_rhythm —— 试听不该改写用户正在编的模式。 */
+int gtr_part_strum_audition(int step)
+{
+    struct gtr_rhythm one;
+    int stroke, palm;
+    if (step < 0 || step >= GTR_STRUM_STEPS) return GTR_E_ARGS;
+    if (!gtr_strum_note(gtr_step_action[step], &stroke, &palm)) return GTR_E_ARGS;
+    one.beats = 1;
+    one.n_steps = 1;
+    one.steps[0].beat = 0.0;
+    one.steps[0].stroke = stroke;
+    one.steps[0].palm_mute = palm;
+    gtr_schedule_pattern(GTR_RHYTHM_USER, &one, gtr_bar_len_ms);
+    return GTR_OK;
 }

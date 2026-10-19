@@ -12,7 +12,7 @@ const WASM = path.join(ROOT, 'build/web/simulator.wasm');
 // Button indices (from screen.c enum)
 const BTN = { OCT_DOWN:0, OCT_UP:1, FX:2, SCL:3, ENV:4, LFO:5, EDIT:6, GLO:7, HOME:8, SAVE:9, ARP:10, SEQ:11, PLAY:12, REC:13 };
 // Page enum
-const PAGE = { OVERVIEW:0, STEPS:1, FM_EDIT:2, FM_ENV:3, FM_LFO:4, TONE_EDIT:5, MIX:6, BLE:7, PROJECT:8, NAME:9, EFFECTS:10, SOURCE:11, ACTIONS:12, STEP_EDIT:13, RHYTHM:14, FM_QUICK:15, PRESET_BROWSER:16, ARP_EDIT:17, STARTUP:18, CHORDS:19 };
+const PAGE = { OVERVIEW:0, STEPS:1, FM_EDIT:2, FM_ENV:3, FM_LFO:4, TONE_EDIT:5, MIX:6, BLE:7, PROJECT:8, NAME:9, EFFECTS:10, SOURCE:11, ACTIONS:12, STEP_EDIT:13, RHYTHM:14, FM_QUICK:15, PRESET_BROWSER:16, ARP_EDIT:17, STARTUP:18, CHORDS:19, STRUM:20 };
 // Chord slot key bits (from gtr_part.c gtr_chord_bits)
 const CHORD_KEY_BITS = [1, 3, 5, 8, 10, 13, 15, 17, 20, 22, 25];
 
@@ -83,10 +83,10 @@ async function main() {
   tap(BTN.SAVE);
   ok(getPage() === PAGE.OVERVIEW, 'Action 19 (STOP ALL) goes to OVERVIEW (page=' + getPage() + ')');
 
-  // Re-enter CHORDS for subsequent tests
+  // Re-enter CHORDS for subsequent tests (action is at 19 now, so +1 not +20)
   tapCombo(BTN.SEQ, BTN.EDIT);
   advanceMs(50);
-  enc(0, 20);
+  enc(0, 1);
   tap(BTN.SAVE);
   ok(getPage() === PAGE.CHORDS, 'Re-entered CHORDS page (page=' + getPage() + ')');
 
