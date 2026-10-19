@@ -131,6 +131,13 @@ static struct gtr_note_q {
     int used;
     uint32_t at_ms;
     uint8_t on, note, velocity;
+    /* 单弦拨的 0-5 = 弦号，-1 = 不按弦记账（扫弦/和弦试听）。
+       B1.9 修复：gtr_held 改成「关音即清」之后，拨弦分支原来靠
+       「同音高 off 是否已排队」判断这根弦还响不响 —— 而它自己为同弦连拨
+       排的那个 off 会先落地把 gtr_held 清掉，于是第三次连拨没有前置 off，
+       合成器对仍在发声的音高不响应，那一下就哑了（实测 t=200 的 on 前面
+       没有任何 off）。带上弦号后，off 只清自己这根弦，on 会把它重新立起来。 */
+    int8_t str;
 } gtr_nq[64];
 
 /* ---- 延迟扫弦队列（节奏型键的一小节排程）----
@@ -167,7 +174,7 @@ static const int *gtr_current_chord(int *n)
     return gtr_golden[gtr_chord];  /*  fallback */
 }
 
-static void gtr_queue_note(uint32_t at, int on, int note, int vel)
+static void gtr_queue_note_str(uint32_t at, int on, int note, int vel, int str)
 {
     int slot;
     for (slot = 0; slot < 64; slot++) {
@@ -177,8 +184,14 @@ static void gtr_queue_note(uint32_t at, int on, int note, int vel)
         gtr_nq[slot].on = on ? 1 : 0;
         gtr_nq[slot].note = (uint8_t)note;
         gtr_nq[slot].velocity = (uint8_t)vel;
+        gtr_nq[slot].str = (int8_t)str;
         return;
     }                                  /* 队列满：丢弃（MVP） */
+}
+
+static void gtr_queue_note(uint32_t at, int on, int note, int vel)
+{
+    gtr_queue_note_str(at, on, note, vel, -1);
 }
 
 /* 每根弦当前鸣响的音高（0 = 无）。合成器对仍在发声的音高不响应重复
@@ -360,10 +373,10 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
                             gtr_nq[slot2].used = 0;
                             break;
                         }
-                    gtr_queue_note(gtr_now_ms, 0, gtr_held[idx], 0);
+                    gtr_queue_note_str(gtr_now_ms, 0, gtr_held[idx], 0, idx);
                 }
-                gtr_queue_note(gtr_now_ms, 1, pe.note, pe.velocity);
-                gtr_queue_note(gtr_now_ms + 500u, 0, pe.note, 0);
+                gtr_queue_note_str(gtr_now_ms, 1, pe.note, pe.velocity, idx);
+                gtr_queue_note_str(gtr_now_ms + 500u, 0, pe.note, 0, idx);
                 gtr_held[idx] = (uint8_t)pe.note;
             }
             break;
@@ -457,14 +470,25 @@ void gtr_part_tick(uint32_t now_ms)
         if (!gtr_nq[slot].used) continue;
         if ((int32_t)(now_ms - gtr_nq[slot].at_ms) < 0) continue;
         if (gtr_nq[slot].on) {
+            /* 单弦拨的 on 自己把这条弦重新立起来：它前面那个 off 是同一次
+               重触发的前半截，不能让它把「正在响」记成「已经停了」。 */
+            if (gtr_nq[slot].str >= 0)
+                gtr_held[gtr_nq[slot].str] = gtr_nq[slot].note;
             gtr_sink(0x90, gtr_nq[slot].note, gtr_nq[slot].velocity);
         } else {
             /* 关音时同步清掉 gtr_held。B1.9 修复：它原先只增不减，记的是
                「曾经按下的音」而不是「仍在响的音」，于是每次重触发的
                gtr_retrigger_prepare 都会为早就停掉的音再补一遍 off
                （实测 4 击模式多出 18 个多余 off，占着 64 格 Note 队列）。 */
-            for (j = 0; j < GTR_CHORD_NOTES; j++)
-                if (gtr_held[j] && gtr_held[j] == gtr_nq[slot].note) gtr_held[j] = 0;
+            if (gtr_nq[slot].str >= 0) {
+                /* 只清自己这根弦：别的弦可能正响着同一个音高 */
+                if (gtr_held[gtr_nq[slot].str] == gtr_nq[slot].note)
+                    gtr_held[gtr_nq[slot].str] = 0;
+            } else {
+                for (j = 0; j < GTR_CHORD_NOTES; j++)
+                    if (gtr_held[j] && gtr_held[j] == gtr_nq[slot].note)
+                        gtr_held[j] = 0;
+            }
             gtr_sink(0x80, gtr_nq[slot].note, 0);
         }
         gtr_nq[slot].used = 0;
