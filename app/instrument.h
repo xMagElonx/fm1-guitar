@@ -183,6 +183,8 @@ unsigned groove_settings_role_value(void);
 int groove_settings_radio(unsigned flags, unsigned role);
 void groove_settings_clock(unsigned mode);
 int groove_settings_status(void);
+int groove_project_save_chords(void);
+int groove_project_get_chord_diff(uint8_t *buf, int cap);
 void groove_transfer_poll(void);
 void groove_transfer_init(void);
 int groove_fm_import(unsigned track, const uint8_t patch[156]);

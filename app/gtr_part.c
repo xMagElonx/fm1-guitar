@@ -17,6 +17,7 @@
    ========================================================================= */
 #include "gtr_part.h"
 #include "gtr_sem.h"
+#include "gtr_chord.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -26,8 +27,9 @@ static const uint32_t gtr_chord_bits[GTR_CHORD_N] = {
     1u << 1,  1u << 3,  1u << 5,  1u << 8,  1u << 10,
     1u << 13, 1u << 15, 1u << 17, 1u << 20, 1u << 22, 1u << 25
 };
-/* 6 弦真实吉他把位（低→高），标准调弦 E2=40 A2=45 D3=50 G3=55 B3=59 E4=64 */
-static const int gtr_chords[GTR_CHORD_N][6] = {
+/* 6 弦真实吉他把位（低→高），标准调弦 E2=40 A2=45 D3=50 G3=55 B3=59 E4=64。
+   金标指法：默认槽固件侧继续播放这些（零行为变化）。 */
+static const int gtr_golden[GTR_CHORD_N][6] = {
     { 41, 48, 53, 57, 60, 65 },   /* 0  F   大横按 1 品 */
     { 48, 55, 60, 64, 67, 72 },   /* 1  C   大横按 8 品 */
     { 43, 47, 50, 55, 59, 67 },   /* 2  G   开放 320003 */
@@ -61,6 +63,20 @@ static const uint8_t gtr_white_bit[16] = {
     0, 2, 4, 6, 7, 9, 11, 12, 14, 16, 18, 19, 21, 23, 24, 26
 };
 
+/* 白键功能 → 内置节奏型 id（-1 = 不是节奏型键）。
+   B1.9：查表替代原来的 4 个 case —— 以后接入 BALLAD（数据早就有，只是没键位）
+   或第 5 个节奏型，只改这张表，不动 gtr_part_keys 的分派逻辑。 */
+static const int8_t k_wk_rhythm[WK_W_N] = {
+    -1, -1, -1, -1, -1, -1,   /* W1-6  拨弦 */
+    -1, -1, -1, -1,           /* W7-10 下扫 / 哑音 / 上扫 / 闷音 */
+    GTR_RHYTHM_FOLK, GTR_RHYTHM_POP, GTR_RHYTHM_PUNK, GTR_RHYTHM_REGGAE,  /* W11-14 */
+    -1, -1                    /* W15-16 重下扫 / 强上扫 */
+};
+
+/* 节奏型状态的「无」哨兵。不能复用 -1：GTR_RHYTHM_USER 也是 -1，
+   两者混用会让「存了自定义模式」和「没有节奏型」变成同一个值。 */
+#define GTR_SEQ_NONE (-2)
+
 /* ---- 状态 ---- */
 static void (*gtr_sink)(uint8_t, uint8_t, uint8_t);
 static int gtr_chord;                   /* 当前和弦 */
@@ -70,12 +86,19 @@ static uint32_t gtr_last_stroke_ms;     /* 交替重置计时 */
 static int gtr_seeded;
 static uint32_t gtr_prev_keys;
 static uint32_t gtr_now_ms;
-static int gtr_seq_rhythm = -1;        /* 按住中的节奏型（-1 = 无） */
+static int gtr_seq_rhythm = GTR_SEQ_NONE; /* 按住中的节奏型（GTR_SEQ_NONE = 无） */
 static int gtr_seq_held;               /* 节奏型键是否仍按住 */
 static uint32_t gtr_bar_end_ms;        /* 当前小节的结束时刻（续排的节拍网格） */
 static uint32_t gtr_bar_len_ms = 2000; /* 小节时长（barSec 2.0s） */
 static char gtr_dbg[20];               /* 诊断回执（LCD 显示，宿主读取） */
 static int gtr_dbg_len;
+
+/* ---- B1.6 和弦库编辑器状态 ---- */
+static gtr_chord_table_t gtr_table;    /* 可变和弦表（编辑器与存储的共用数据层） */
+static gtr_chord_edit_t gtr_editor;    /* 编辑器状态机 */
+static int gtr_edit_mode;              /* 1=CHORDS 页编辑模式 0=演奏模式 */
+static int gtr_voicing_buf[GTR_CHORD_NOTES]; /* 生成 voicing 的返回缓冲 */
+static int gtr_table_inited;           /* 表是否已初始化 */
 
 static void dbg_put(char c)            /* 越界保护：写满即丢，绝不越过缓冲区
                                           （P1 修复：gtr_part_dbg 无人调用时
@@ -110,17 +133,38 @@ static struct gtr_note_q {
     uint8_t on, note, velocity;
 } gtr_nq[64];
 
-/* ---- 延迟扫弦队列（节奏型键的一小节排程）---- */
+/* ---- 延迟扫弦队列（节奏型键的一小节排程）----
+   B1.9：16 → GTR_MAX_STEPS。自定义模式最多 32 击，队列装不下就会被静默丢弃；
+   内置节奏型最多 8 击，所以这个问题一直被掩盖着。 */
+#define GTR_SQ_N GTR_MAX_STEPS
 static struct gtr_stroke_q {
     int used;
     uint32_t at_ms;
     int stroke;
-} gtr_sq[16];
+    int palm;          /* 1 = 闷音步：走 gtr_sem 的 muted 路径（gate 钳 0.14） */
+} gtr_sq[GTR_SQ_N];
+
+/* ---- B1.9 自定义节奏状态（编辑器 / 存储写入的数据层）---- */
+static struct gtr_rhythm gtr_user_rhythm;
+static int gtr_user_ok;        /* 1 = 存有合法模式 */
+static int gtr_sq_drops;       /* 诊断：排程时队列满而丢弃的击数 */
 
 static const int *gtr_current_chord(int *n)
 {
     *n = GTR_CHORD_NOTES;
-    return gtr_chords[gtr_chord];
+    /* 默认槽 → 金标指法（零行为变化）；改过的槽 → 生成 voicing */
+    if (!gtr_table_inited || gtr_chord_table_is_default(&gtr_table, gtr_chord) == 1)
+        return gtr_golden[gtr_chord];
+    int root, type;
+    if (gtr_chord_table_get(&gtr_table, gtr_chord, &root, &type) == GTR_CHORD_OK) {
+        uint8_t v[GTR_CHORD_STRINGS];
+        if (gtr_chord_voicing(root, type, v) == GTR_CHORD_OK) {
+            for (int i = 0; i < GTR_CHORD_NOTES; i++)
+                gtr_voicing_buf[i] = v[i];
+            return gtr_voicing_buf;
+        }
+    }
+    return gtr_golden[gtr_chord];  /*  fallback */
 }
 
 static void gtr_queue_note(uint32_t at, int on, int note, int vel)
@@ -159,7 +203,7 @@ static void gtr_retrigger_prepare(void)
         if (gtr_held[j]) gtr_queue_note(gtr_now_ms, 0, gtr_held[j], 0);
 }
 
-static void gtr_emit_v(int stroke_id, int vel_high, int vel_low)
+static void gtr_emit_ex(int stroke_id, int vel_high, int vel_low, int palm)
 {
     const int *chord; int n = 0, i;
     struct gtr_strum_opts opts;
@@ -173,6 +217,7 @@ static void gtr_emit_v(int stroke_id, int vel_high, int vel_low)
     opts.gate = 0.4;       /* 0.4s：单扫的余音长度（循环扫弦由重触发接管） */
     opts.velHigh = vel_high;
     opts.velLow = vel_low;
+    opts.palm_mute = palm ? 1 : 0;
     if (gtr_strum(chord, n, &opts, ev, GTR_MAX_EVENTS, &len) != GTR_OK) {
         dbg_put('E');
         dbg_num(-GTR_E_INTERNAL);        /* 粗报：内部失败 */
@@ -192,9 +237,34 @@ static void gtr_emit_v(int stroke_id, int vel_high, int vel_low)
         gtr_held[ev[i].string % GTR_CHORD_NOTES] = (uint8_t)ev[i].note;
 }
 
+static void gtr_emit_v(int stroke_id, int vel_high, int vel_low)
+{
+    gtr_emit_ex(stroke_id, vel_high, vel_low, 0);
+}
+
 static void gtr_emit(int stroke_id)
 {
-    gtr_emit_v(stroke_id, 127, 100);   /* 成品力度：音量拉满，不会被淹没 */
+    gtr_emit_ex(stroke_id, 127, 100, 0);   /* 成品力度：音量拉满，不会被淹没 */
+}
+
+/* 试听一个 (root, type) 和弦：块和弦（六弦同响），500ms gate */
+static void gtr_audition_chord(int root, int type)
+{
+    uint8_t v[GTR_CHORD_STRINGS];
+    if (gtr_chord_voicing(root, type, v) != GTR_CHORD_OK) {
+        dbg_put('E');
+        dbg_num(-GTR_CHORD_E_INTERNAL);
+        return;
+    }
+    gtr_retrigger_prepare();
+    for (int i = 0; i < GTR_CHORD_NOTES; i++) {
+        gtr_queue_note(gtr_now_ms, 1, v[i], 100);
+        gtr_queue_note(gtr_now_ms + 500u, 0, v[i], 0);
+    }
+    memset(gtr_held, 0, sizeof gtr_held);
+    for (int i = 0; i < GTR_CHORD_NOTES; i++)
+        gtr_held[i] = v[i];
+    dbg_put('A');
 }
 
 int gtr_part_latch(void) { return 1; }          /* 常驻：兼容旧查询 */
@@ -211,6 +281,7 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
                    uint32_t now_ms)
 {
     uint32_t rose = current_keys & ~previous_keys;
+    uint32_t fell = previous_keys & ~current_keys;
     int w, chord_changed = (gtr_chord != gtr_alt_chord);
 
     gtr_now_ms = now_ms;
@@ -220,9 +291,34 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
         gtr_seeded = 1;
         return;
     }
+    /* 延迟初始化表和编辑器（首次按键时） */
+    if (!gtr_table_inited) {
+        gtr_chord_table_init(&gtr_table);
+        gtr_chord_edit_init(&gtr_editor, &gtr_table);
+        gtr_table_inited = 1;
+    }
     /* 交替状态重置：换和弦或停 2 秒 */
     if (chord_changed || (uint32_t)(now_ms - gtr_last_stroke_ms) > 2000u)
         gtr_alt_up = 0;
+
+    if (gtr_edit_mode) {
+        /* CHORDS 页编辑模式：黑键选槽+试听，白键停用 */
+        for (w = 0; w < GTR_CHORD_N; w++) {
+            if (rose & gtr_chord_bits[w]) {
+                gtr_chord_edit_press(&gtr_editor, w);
+                gtr_chord = w;  /* 同步当前和弦（试听用） */
+                int root, type;
+                if (gtr_chord_edit_audition(&gtr_editor, &root, &type) == 1)
+                    gtr_audition_chord(root, type);
+                dbg_put('B');
+                dbg_num(w);
+            }
+            if (fell & gtr_chord_bits[w])
+                gtr_chord_edit_release(&gtr_editor);
+        }
+        gtr_prev_keys = current_keys;
+        return;
+    }
 
     /* 黑键 = 静默选和弦 */
     for (w = 0; w < GTR_CHORD_N; w++) {
@@ -236,10 +332,17 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
     /* 白键 = Ample 式扫弦面板 */
     for (w = 0; w < 16; w++) {
         uint32_t mask = 1u << gtr_white_bit[w];
+        int rid;
         if (!(rose & mask)) continue;
         dbg_put('W');
         dbg_num(w);
         dbg_put(' ');
+        rid = k_wk_rhythm[gtr_white_type[w]];
+        if (rid >= 0) {            /* B1.9：节奏型键查表，不再占用 switch 分支 */
+            gtr_seq_rhythm = rid;
+            gtr_schedule_bar(rid); /* 按下立即起一小节（原来是 case 分支的副作用） */
+            continue;
+        }
         switch (gtr_white_type[w]) {
         case WK_PLUCK6: case WK_PLUCK5: case WK_PLUCK4:
         case WK_PLUCK3: case WK_PLUCK2: case WK_PLUCK1: {
@@ -273,10 +376,6 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
         case WK_DOWN_MUTE: gtr_emit(GTR_STROKE_CHUCK); gtr_last_stroke_ms = now_ms; break;
         case WK_UP:        gtr_emit(GTR_STROKE_UP);    gtr_last_stroke_ms = now_ms; break;
         case WK_PALM:      gtr_emit_v(GTR_STROKE_DOWN, 80, 55); gtr_last_stroke_ms = now_ms; break;
-        case WK_SEQ_FOLK:   gtr_seq_rhythm = GTR_RHYTHM_FOLK;   break;
-        case WK_SEQ_POP:    gtr_seq_rhythm = GTR_RHYTHM_POP;    break;
-        case WK_SEQ_PUNK:   gtr_seq_rhythm = GTR_RHYTHM_PUNK;   break;
-        case WK_SEQ_REGGAE: gtr_seq_rhythm = GTR_RHYTHM_REGGAE; break;
         case WK_HEAVY:     gtr_emit_v(GTR_STROKE_DOWN, 127, 100); gtr_last_stroke_ms = now_ms; break;
         case WK_UP_STRONG: gtr_emit_v(GTR_STROKE_UP, 112, 80);  gtr_last_stroke_ms = now_ms; break;
         default: break;
@@ -284,27 +383,37 @@ void gtr_part_keys(uint32_t previous_keys, uint32_t current_keys,
     }
     /* 节奏型键：按下立即起一小节；按住持续循环（tick 续排），松手当前小节收尾 */
     gtr_seq_held = (current_keys & GTR_SEQ_MASK) != 0;
-    if (gtr_seq_rhythm >= 0 && (rose & GTR_SEQ_MASK) && !gtr_seq_held)
-        gtr_seq_rhythm = -1;
+    if (gtr_seq_rhythm != GTR_SEQ_NONE && (rose & GTR_SEQ_MASK) && !gtr_seq_held)
+        gtr_seq_rhythm = GTR_SEQ_NONE;
     gtr_prev_keys = current_keys;
 }
 
-/* 节奏型键：排程一小节的扫弦（延迟队列，tick 到点逐刷下发） */
+/* 节奏型键：排程一小节的扫弦（延迟队列，tick 到点逐刷下发）。
+   B1.9：rhythm_id == GTR_RHYTHM_USER 时把已存的自定义模式交给展开器。 */
 static void gtr_schedule_bar(int rhythm_id)
 {
     struct gtr_stroke_sched sched[GTR_MAX_STEPS];
+    const struct gtr_rhythm *cust = NULL;
+    double bar_sec = (double)gtr_bar_len_ms / 1000.0;
     int len = 0, i, slot;
-    int erc = gtr_expand_rhythm(rhythm_id, NULL, 2.0, sched, GTR_MAX_STEPS, &len);
+    int erc;
+    if (rhythm_id == GTR_RHYTHM_USER) {
+        if (!gtr_user_ok) return;               /* 没存过模式 → 不出声 */
+        cust = &gtr_user_rhythm;
+    }
+    erc = gtr_expand_rhythm(rhythm_id, cust, bar_sec, sched, GTR_MAX_STEPS, &len);
     if (erc != GTR_OK)
         return;
     for (i = 0; i < len; i++) {
-        for (slot = 0; slot < 16; slot++) {
+        for (slot = 0; slot < GTR_SQ_N; slot++) {
             if (gtr_sq[slot].used) continue;
             gtr_sq[slot].used = 1;
             gtr_sq[slot].at_ms = gtr_now_ms + (uint32_t)(sched[i].at * 1000.0);
             gtr_sq[slot].stroke = sched[i].stroke;
+            gtr_sq[slot].palm = sched[i].palm_mute;
             break;
         }
+        if (slot == GTR_SQ_N) gtr_sq_drops++;   /* 队列满：记数，不再静默丢弃 */
     }
     gtr_bar_end_ms = gtr_now_ms + gtr_bar_len_ms;   /* 网格：按小节时长续排 */
 }
@@ -316,27 +425,189 @@ void gtr_part_tick(uint32_t now_ms)
                                   导致节奏型键的整小节排程沉没） */
     if (!gtr_sink) return;
     /* 到期的延迟扫弦 → 立即展开成音符入队 */
-    for (slot = 0; slot < 16; slot++) {
+    for (slot = 0; slot < GTR_SQ_N; slot++) {
         if (!gtr_sq[slot].used) continue;
         if ((int32_t)(now_ms - gtr_sq[slot].at_ms) < 0) continue;
-        gtr_emit(gtr_sq[slot].stroke);
+        /* 闷音步必须走 palm=1：否则自定义模式里的闷音会悄悄退化成普通下扫
+           （gate 400ms 而不是 140ms，听起来就是没闷住）。 */
+        gtr_emit_ex(gtr_sq[slot].stroke, 127, 100, gtr_sq[slot].palm);
         gtr_sq[slot].used = 0;
     }
-    /* 按住节奏型键 → 当前小节弹完自动续下一小节（循环） */
-    if (gtr_seq_held && gtr_seq_rhythm >= 0 &&
+    /* 按住节奏型键 → 当前小节弹完自动续下一小节（循环）。
+       用 != GTR_SEQ_NONE 而不是 >= 0：GTR_RHYTHM_USER 是 -1，
+       写成 >= 0 会让自定义模式永远续不上（现在 trigger 不按住，
+       等 M2 给了自定义模式一个键位，这个洞就会显形）。 */
+    if (gtr_seq_held && gtr_seq_rhythm != GTR_SEQ_NONE &&
         (int32_t)(now_ms - gtr_bar_end_ms) >= 0) {
         int any = 0;
-        for (slot = 0; slot < 16; slot++) if (gtr_sq[slot].used) { any = 1; break; }
+        for (slot = 0; slot < GTR_SQ_N; slot++) if (gtr_sq[slot].used) { any = 1; break; }
         if (!any) gtr_schedule_bar(gtr_seq_rhythm);   /* 小节到点且排空 → 续排 */
     }
     /* 到期的 Note On/Off */
     for (slot = 0; slot < 64; slot++) {
+        int j;
         if (!gtr_nq[slot].used) continue;
         if ((int32_t)(now_ms - gtr_nq[slot].at_ms) < 0) continue;
-        if (gtr_nq[slot].on)
+        if (gtr_nq[slot].on) {
             gtr_sink(0x90, gtr_nq[slot].note, gtr_nq[slot].velocity);
-        else
+        } else {
+            /* 关音时同步清掉 gtr_held。B1.9 修复：它原先只增不减，记的是
+               「曾经按下的音」而不是「仍在响的音」，于是每次重触发的
+               gtr_retrigger_prepare 都会为早就停掉的音再补一遍 off
+               （实测 4 击模式多出 18 个多余 off，占着 64 格 Note 队列）。 */
+            for (j = 0; j < GTR_CHORD_NOTES; j++)
+                if (gtr_held[j] && gtr_held[j] == gtr_nq[slot].note) gtr_held[j] = 0;
             gtr_sink(0x80, gtr_nq[slot].note, 0);
+        }
         gtr_nq[slot].used = 0;
     }
+}
+
+/* ==========================================================================
+   B1.6 和弦库编辑器 API 实现
+   ========================================================================== */
+
+void gtr_part_edit_init(void)
+{
+    if (!gtr_table_inited) {
+        gtr_chord_table_init(&gtr_table);
+        gtr_chord_edit_init(&gtr_editor, &gtr_table);
+        gtr_table_inited = 1;
+    }
+}
+
+void gtr_part_edit_mode(int on)
+{
+    gtr_edit_mode = on ? 1 : 0;
+    if (gtr_edit_mode && !gtr_table_inited)
+        gtr_part_edit_init();
+}
+
+int gtr_part_edit_knob(int knob, int delta)
+{
+    if (!gtr_table_inited) return 0;
+    gtr_chord_edit_knob(&gtr_editor, knob, delta);
+    return gtr_editor.dirty;
+}
+
+int gtr_part_edit_modifier(int env, int lfo)
+{
+    if (!gtr_table_inited) return GTR_CHORD_E_ARGS;
+    return gtr_chord_edit_modifier(&gtr_editor, env, lfo);
+}
+
+int gtr_part_edit_reset_slot(void)
+{
+    if (!gtr_table_inited) return 0;
+    int before = gtr_editor.dirty;
+    gtr_chord_edit_reset_slot(&gtr_editor);
+    return gtr_editor.dirty != before ? 1 : 0;
+}
+
+int gtr_part_edit_is_dirty(void)
+{
+    return gtr_table_inited ? gtr_editor.dirty : 0;
+}
+
+void gtr_part_edit_saved(void)
+{
+    if (gtr_table_inited)
+        gtr_chord_edit_saved(&gtr_editor);
+}
+
+int gtr_part_edit_pack_diff(uint8_t *buf, int cap)
+{
+    if (!gtr_table_inited) gtr_part_edit_init();
+    return gtr_chord_table_pack_diff(&gtr_table, buf, cap);
+}
+
+int gtr_part_edit_unpack_diff(const uint8_t *buf, int len)
+{
+    if (!gtr_table_inited) gtr_part_edit_init();
+    return gtr_chord_table_unpack_diff(&gtr_table, buf, len);
+}
+
+int gtr_part_edit_selected(void)
+{
+    return gtr_table_inited ? gtr_editor.selected : 0;
+}
+
+int gtr_part_edit_slot_root(int slot)
+{
+    if (!gtr_table_inited || slot < 0 || slot >= GTR_CHORD_SLOTS) return -1;
+    return gtr_table.slots[slot].root;
+}
+
+int gtr_part_edit_slot_type(int slot)
+{
+    if (!gtr_table_inited || slot < 0 || slot >= GTR_CHORD_SLOTS) return -1;
+    return gtr_table.slots[slot].type;
+}
+
+int gtr_part_edit_slot_name(int slot, char *buf, int cap)
+{
+    if (!gtr_table_inited || slot < 0 || slot >= GTR_CHORD_SLOTS || !buf)
+        return GTR_CHORD_E_ARGS;
+    return gtr_chord_name(gtr_table.slots[slot].root, gtr_table.slots[slot].type, buf, cap);
+}
+
+int gtr_part_edit_slot_is_default(int slot)
+{
+    if (!gtr_table_inited || slot < 0 || slot >= GTR_CHORD_SLOTS) return -1;
+    return gtr_chord_table_is_default(&gtr_table, slot);
+}
+
+/* ==========================================================================
+   B1.9 扫弦节奏编辑器 M1：自定义模式数据通路
+   ========================================================================== */
+
+int gtr_part_set_user_rhythm(const struct gtr_rhythm *r)
+{
+    struct gtr_stroke_sched probe[GTR_MAX_STEPS];
+    int len = 0, i, rc;
+
+    if (!r) return GTR_E_ARGS;
+    /* 步必须严格递增。同一毫秒上的两击会在同一个 tick 里被展开，第二击的
+       gtr_retrigger_prepare 会把第一击刚按响的音 off 掉 —— 听起来像丢了一拍。
+       步进网格天然严格递增，走到这里还不递增就是编辑器算错了，直接拒。 */
+    for (i = 1; i < r->n_steps; i++)
+        if (!(r->steps[i].beat > r->steps[i - 1].beat)) return GTR_E_RHYTHM;
+    /* 用真正的展开器当校验器：beats 范围 / stroke 合法性 / n_steps 上限
+       全由它把关。所以「存进去的一定放得出来」不是承诺，是同一次调用。 */
+    rc = gtr_expand_rhythm(GTR_RHYTHM_USER, r, (double)gtr_bar_len_ms / 1000.0,
+                           probe, GTR_MAX_STEPS, &len);
+    if (rc != GTR_OK) return rc;
+    (void)len;
+    gtr_user_rhythm = *r;
+    gtr_user_ok = 1;
+    return GTR_OK;
+}
+
+int gtr_part_user_rhythm_steps(void)
+{
+    return gtr_user_ok ? gtr_user_rhythm.n_steps : 0;
+}
+
+int gtr_part_trigger_rhythm(int rhythm_id)
+{
+    if (rhythm_id == GTR_RHYTHM_USER) {
+        if (!gtr_user_ok) return GTR_E_ARGS;      /* 还没存过模式 → 不出声 */
+    } else if (rhythm_id < GTR_RHYTHM_FOLK || rhythm_id > GTR_RHYTHM_BALLAD) {
+        return GTR_E_RHYTHM;
+    }
+    gtr_seq_rhythm = rhythm_id;
+    gtr_schedule_bar(rhythm_id);
+    return GTR_OK;
+}
+
+void gtr_part_stop_rhythm(void)
+{
+    /* 只停「续排」：已排进队列的击照常播完当前小节，不硬切。 */
+    gtr_seq_held = 0;
+    gtr_seq_rhythm = GTR_SEQ_NONE;
+}
+
+int gtr_part_dropped_strokes(void)
+{
+    return gtr_sq_drops;
 }

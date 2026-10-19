@@ -4,6 +4,7 @@
 #include "version.h"
 #include "fm1_engine_control.h"
 #include "gtr_part.h"
+#include "gtr_chord.h"
 #include <string.h>
 enum {
     BACK = 0x0000,
@@ -148,7 +149,7 @@ static void text(unsigned x, unsigned y, const char *s, unsigned scale, uint16_t
 }
 /* Eight tracks stay visible on HOME. SEQ maps the sixteen white keys to one
  * quarter of the 64-step pattern. All drawing and edits run on app_control. */
-enum { OVERVIEW, STEPS, FM_EDIT, FM_ENV, FM_LFO, TONE_EDIT, MIX, BLE, PROJECT, NAME, EFFECTS, SOURCE, ACTIONS, STEP_EDIT, RHYTHM, FM_QUICK, PRESET_BROWSER, ARP_EDIT, STARTUP };
+enum { OVERVIEW, STEPS, FM_EDIT, FM_ENV, FM_LFO, TONE_EDIT, MIX, BLE, PROJECT, NAME, EFFECTS, SOURCE, ACTIONS, STEP_EDIT, RHYTHM, FM_QUICK, PRESET_BROWSER, ARP_EDIT, STARTUP, CHORDS };
 enum { OCT_DOWN, OCT_UP, FX, SCL, ENV, LFO, EDIT, GLO, HOME, SAVE, ARP, SEQ, PLAY, REC };
 #define BUTTON(b) (1U << (b))
 static const uint16_t colors[8] = {0x3c9f, 0x07bf, 0x4eae, 0x06d4, 0xac9f, 0xed18, 0xff06, 0xfba5};
@@ -175,7 +176,7 @@ static const char *const source_names[] = {"DX7 FM", "BASS 303", "DRUM 808", "PS
 static const char *const actions[] = {"STEP DETAILS", "RHYTHM / RECORD", "COPY STEP", "COPY PAGE", "COPY TRACK",
     "PASTE STEP", "PASTE PAGE", "PASTE TRACK", "CLEAR STEP", "CLEAR PAGE", "CLEAR TRACK",
     "REPEAT TO 32", "REPEAT TO 48", "REPEAT TO 64", "UNDO / REDO", "COPY TIMBRE", "PASTE TIMBRE",
-    "DX7 PATCH NAME", "BLUETOOTH / CLOCK", "STOP ALL / REWIND"};
+    "DX7 PATCH NAME", "BLUETOOTH / CLOCK", "STOP ALL / REWIND", "CHORD LIBRARY"};
 enum { ACTION_COUNT = sizeof actions / sizeof actions[0] };
 static unsigned source_preview, action, action_confirm, tone_clip_ready;
 static struct groove_preset tone_clip;
@@ -1363,6 +1364,72 @@ static __attribute__((noinline, cold, minsize)) void boot_draw(void)
         paint_fill(58 + 16 * i, 166 - height[i] / 2, 12, height[i],
                    i < boot_phase ? colors[i] : PANEL);
 }
+static void chords_draw(void)
+{
+    text(8, 8, "CHORD LIBRARY", 2, ACCENT, BACK);
+    int sel = gtr_part_edit_selected();
+
+    /* 11 slots, compact list */
+    for (int i = 0; i < GTR_CHORD_SLOTS; i++) {
+        int y = 36 + i * 15;
+        uint16_t bg = (i == sel) ? PANEL : BACK;
+        uint16_t fg = (i == sel) ? ACCENT : TEXT;
+        paint_fill(4, y, 232, 13, bg);
+
+        char label[20];
+        int pos = 0;
+        label[pos++] = '[';
+        if (i >= 10) label[pos++] = '1';
+        label[pos++] = (char)('0' + (i % 10));
+        label[pos++] = ']';
+        label[pos++] = ' ';
+
+        char name[8];
+        gtr_part_edit_slot_name(i, name, sizeof name);
+        for (const char *p = name; *p && pos < 15; p++) label[pos++] = *p;
+
+        if (gtr_part_edit_slot_is_default(i) == 0) {
+            label[pos++] = ' ';
+            label[pos++] = '*';
+        }
+        label[pos] = '\0';
+
+        text(8, y + 2, label, 1, fg, bg);
+    }
+
+    /* Knob displays: K1=ROOT (note name), K2=TYPE (type name) */
+    int root = gtr_part_edit_slot_root(sel);
+    int type = gtr_part_edit_slot_type(sel);
+    char root_val[8], type_val[8];
+    if (root >= 0 && root < 12) {
+        strncpy(root_val, gtr_chord_note_name[root], sizeof root_val - 1);
+        root_val[sizeof root_val - 1] = '\0';
+    } else {
+        strcpy(root_val, "--");
+    }
+    if (type >= 0 && type < GTR_CHORD_NTYPES) {
+        if (gtr_chord_type_name[type][0] == '\0')
+            strcpy(type_val, "maj");
+        else {
+            strncpy(type_val, gtr_chord_type_name[type], sizeof type_val - 1);
+            type_val[sizeof type_val - 1] = '\0';
+        }
+    } else {
+        strcpy(type_val, "--");
+    }
+
+    knob(0, "ROOT", root_val, colors[0]);
+    knob(1, "TYPE", type_val, colors[1]);
+    knob(2, "-", "--", colors[2]);
+    knob(3, "-", "--", colors[3]);
+
+    /* Hint */
+    if (gtr_part_edit_is_dirty())
+        text(8, 231, "SAVE TO STORE  HOME EXIT", 1, AMBER, BACK);
+    else
+        text(8, 231, "BLACK KEY SELECT  K1/K2 EDIT", 1, DIM, BACK);
+}
+
 static void draw_page_body(const struct fm1_ble_status *ble)
 {
     unsigned visible = boot_active ? STARTUP : glo_down && glo_used ? MIX : page;
@@ -1398,6 +1465,10 @@ static void draw_page_body(const struct fm1_ble_status *ble)
         return;
     }
     header(v);
+    if (visible == CHORDS) {
+        chords_draw();
+        return;
+    }
     if (visible >= SOURCE) {
         edit_page_draw(visible);
         return;
@@ -1813,6 +1884,8 @@ static int apply_controls(const struct fm1_controls *controls, uint32_t now,
     previous_keys = controls->keys;
     /* B1 吉他语义部件：ENV 按住 + OVERVIEW 页时接管音名键（详见 app/gtr_part.c）。 */
     gtr_part_set_sink(gtr_post_sink);
+    /* B1.6: 离开 CHORDS 页时关闭编辑模式（防止紧急停止/撤销等路径遗漏） */
+    if (page != CHORDS) gtr_part_edit_mode(0);
     if (key_down) {                            /* 诊断探针：输入到达闪现 */
         notice = "INPUT OK";
         notice_until = now + 400U;
@@ -1931,6 +2004,28 @@ static int apply_controls(const struct fm1_controls *controls, uint32_t now,
         writing = rec_before_press;
         edit_down = glo_down = 0;
         page = NAME; name_cursor = 0;
+        goto controls_done;
+    }
+    /* CHORDS page: intercept ENV/LFO/encoders/SAVE/HOME before page switching */
+    if (page == CHORDS) {
+        int env = (controls->buttons & BUTTON(ENV)) ? 1 : 0;
+        int lfo = (controls->buttons & BUTTON(LFO)) ? 1 : 0;
+        gtr_part_edit_modifier(env, lfo);
+        if (controls->encoders[0]) gtr_part_edit_knob(1, controls->encoders[0]);
+        if (controls->encoders[1]) gtr_part_edit_knob(2, controls->encoders[1]);
+        if (pressed & BUTTON(SAVE)) {
+            if (groove_project_save_chords() == 0) {
+                gtr_part_edit_saved();
+                notice = "CHORDS SAVED";
+            } else {
+                notice = "TOO MANY CHANGES - RESET A SLOT";
+            }
+            notice_until = now + 2000U;
+        }
+        if (pressed & BUTTON(HOME)) {
+            gtr_part_edit_mode(0);
+            page = music_page;
+        }
         goto controls_done;
     }
     if (pressed & (BUTTON(HOME) | BUTTON(SEQ) | BUTTON(FX) | BUTTON(SCL) |
@@ -2108,10 +2203,11 @@ static int apply_controls(const struct fm1_controls *controls, uint32_t now,
                 if (groove_source_type(track) == GROOVE_DX7) { page = NAME; name_cursor = 0; }
                 else r = -1;
             } else if (action == 18) { page = BLE; ble_view = ble_forget = ble_action = 0; ble_result = 0; }
-            else {
+            else if (action == 19) {
                 if (!post(0xff, 0, 0, 1)) return 0;
                 memset(key_note, 0xff, sizeof key_note); writing = 0; page = OVERVIEW;
             }
+            else if (action == 20) { page = CHORDS; gtr_part_edit_mode(1); }
             notice = r == -3 ? "COPY MATCHING STEP / PAGE / TRACK FIRST"
                 : r == -2 ? "CHORD / LOCK TABLE FULL" : r ? "UNAVAILABLE / INCOMPATIBLE"
                 : operation == 2 ? "STEP COPIED - CHOOSE DESTINATION"

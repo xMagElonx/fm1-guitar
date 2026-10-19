@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-only WITH GPL-3.0-linking-exception */
 #include "instrument.h"
+#include "gtr_part.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -14,13 +15,13 @@ enum { PROJECT_MAGIC = 0x35504d46U, SETTINGS_MAGIC = 0x35534d46U,
        USER_BYTES = (GROOVE_PROJECT_SLOTS + 1) * FM1_FLASH_SECTOR_BYTES };
 struct header { uint32_t magic, generation, target, crc, commit; };
 /* Device preferences are independent of project editing and undo. */
-struct settings { uint8_t role, clock, slot, radio_off; };
+struct settings { uint8_t role, clock, slot, radio_off, chord_diff[8]; };
 static struct record {
     struct header header;
     struct groove_project project;
     struct settings settings;
 } record;
-_Static_assert(sizeof record == 4088, "single-sector project record");
+_Static_assert(sizeof record == 4096, "single-sector project record");
 _Static_assert(sizeof record <= FM1_FLASH_SECTOR_BYTES, "one record per sector");
 static struct settings settings;
 static char project_name[12] = {'U', 'N', 'T', 'I', 'T', 'L', 'E', 'D', ' ', ' ', ' ', ' '};
@@ -49,7 +50,9 @@ uint32_t groove_crc32(uint32_t crc, const void *data, unsigned bytes)
 static uint32_t checksum(void)
 {
     uint32_t crc = groove_crc32(~0U, &record.header, offsetof(struct header, crc));
-    crc = groove_crc32(crc, &record.settings, sizeof record.settings);
+    unsigned legacy = record.header.magic == LEGACY_PROJECT_MAGIC ||
+                      record.header.magic == LEGACY_SETTINGS_MAGIC;
+    crc = groove_crc32(crc, &record.settings, legacy ? 4 : sizeof record.settings);
     if (record.header.magic == PROJECT_MAGIC)
         crc = groove_crc32(crc, &record.project, sizeof record.project);
     else if (record.header.magic == LEGACY_PROJECT_MAGIC)
@@ -75,9 +78,11 @@ static int read_sector(unsigned sector)
         r = fm1_flash_read(address + sizeof record.header, &record.project, bytes);
     if (!r)
         r = fm1_flash_read(address + sizeof record.header + bytes,
-                           &record.settings, sizeof record.settings);
+                           &record.settings, legacy ? 4 : sizeof record.settings);
     if (r)
         return r;
+    if (legacy)
+        memset(record.settings.chord_diff, 0xFF, sizeof record.settings.chord_diff);
     const struct settings *s = &record.settings;
     if (h->crc != checksum() || s->role > FM1_BLE_CENTRAL || s->clock > GROOVE_CLOCK_MIDI ||
         s->slot >= GROOVE_PROJECT_SLOTS || (s->radio_off & ~GROOVE_RADIO_ALL) ||
@@ -349,6 +354,25 @@ void groove_settings_clock(unsigned mode)
         settings_mark();
     }
 }
+int groove_project_save_chords(void)
+{
+    uint8_t diff[sizeof settings.chord_diff];
+    int r = gtr_part_edit_pack_diff(diff, sizeof diff);
+    if (r != (int)sizeof diff)
+        return GROOVE_PROJECT_INVALID;
+    if (!memcmp(settings.chord_diff, diff, sizeof diff))
+        return 0;
+    memcpy(settings.chord_diff, diff, sizeof settings.chord_diff);
+    settings_mark();
+    return 0;
+}
+int groove_project_get_chord_diff(uint8_t *buf, int cap)
+{
+    if (!buf || cap < (int)sizeof settings.chord_diff)
+        return GROOVE_PROJECT_INVALID;
+    memcpy(buf, settings.chord_diff, sizeof settings.chord_diff);
+    return (int)sizeof settings.chord_diff;
+}
 int groove_settings_status(void) { return settings_result; }
 void groove_project_init(void)
 {
@@ -373,6 +397,7 @@ void groove_project_poll(void)
             settings = record.settings;
             groove_clock_set(settings.clock);
             role_pending = 2;
+            gtr_part_edit_unpack_diff(settings.chord_diff, sizeof settings.chord_diff);
         }
         restore_pending = 1;
     }
