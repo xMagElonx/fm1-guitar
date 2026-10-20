@@ -21,6 +21,7 @@ const PAGE_STRUM = 20;
 const WHITE = [0, 2, 4, 6, 7, 9, 11, 12, 14, 16, 18, 19, 21, 23, 24, 26];
 /* Cell fill colour per action, mirrors strum_color() in screen.c. */
 const C_DOWN = 0x3c9f, C_UP = 0x06d4, C_CHUCK = 0xfd20, C_MUTE = 0xac9f, C_REST = 0x18e3;
+const C_BACK = 0x0000;   /* screen.c: BACK —— 页脚带先 paint_fill 成这个色 */
 
 let pass = 0, fail = 0;
 function ok(cond, msg) {
@@ -150,6 +151,21 @@ async function main() {
   advanceMs(80);
   ok(cellPixel(0) === C_REST && cellPixel(2) === C_REST, 'every cell back to REST');
   ok(ledOfKey(WHITE[1]) === 0, 'step 2 LED off after clear');
+
+  console.log('\n=== S10: the branch version tag is on the footer ===');
+  /* 真机验货靠这四字节：tester 看这页右下角是不是 B2.0，就知道刷的是哪一包。
+     开机屏的 V12 是上游版本号（打包脚本只认纯 V+数字），区分不了分支版本。
+     采样整块 24x7 区域而不是单个像素 —— 字模笔画位置会随字号调整而移，
+     但「这块区域里有东西」是稳定事实。 */
+  {
+    const ptr = ex.sim_pixels();
+    const px = new Uint16Array(ex.memory.buffer, ptr, 240 * 240);
+    let inked = 0;
+    for (let y = 231; y < 238; y++)
+      for (let x = 206; x < 230; x++)
+        if (px[y * 240 + x] !== C_BACK) inked++;
+    ok(inked > 20, 'footer 右下角画了版本标记（' + inked + ' 个非底色像素）');
+  }
 
   console.log('\n========================================');
   console.log('Results: ' + pass + ' passed, ' + fail + ' failed');

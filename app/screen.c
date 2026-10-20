@@ -1519,6 +1519,10 @@ static void strum_draw(void)
     paint_fill(0, 228, 240, 12, BACK);
     text(8, 231, notice ? notice : "SAVE PLAY  HOME EXIT", 1,
          notice ? TEXT : DIM, BACK);
+    /* 分支版本标记。上游 FM1_RELEASE_VERSION 只能是纯 "V12"（打包脚本强校验，
+       且该值要进更新元数据），所以分支版本标在本分支独有的这一页上。
+       真机验货：这页右下角写 B2.0 就是含 STRUM 页的那一包。 */
+    text(206, 231, "B2.0", 1, DIM, BACK);
 }
 
 static void draw_page_body(const struct fm1_ble_status *ble)
