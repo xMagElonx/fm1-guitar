@@ -73,10 +73,12 @@ export async function runWasmTest(opts) {
   return { code, skipped: false };
 }
 
-/* 子进程方式跑某一层（run_all.mjs 用）。 */
-export function runLayer(script) {
+/* 子进程方式跑某一层（run_all.mjs 用）。args 透传给子进程。
+   注：stdout 用 pipe 收进来做汇总；SKIP/Fail 时 run_all 会把全文打出来。 */
+export function runLayer(script, args = []) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'inherit'] });
+    const child = spawn(process.execPath, [script, ...args],
+                        { stdio: ['ignore', 'pipe', 'inherit'] });
     let out = '';
     child.stdout.on('data', (d) => { out += d.toString(); });
     child.on('close', (code) => resolve({ code, out }));

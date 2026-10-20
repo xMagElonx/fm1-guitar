@@ -21,7 +21,7 @@ const rows = [];
 for (const [name, rel] of layers) {
   const script = path.join(here, rel);
   const { code, out } = await runLayer(script, process.argv.slice(2));
-  const summary = out.split('\n').filter((l) => /结论|结论：|项检查|SKIP/.test(l)).pop() || '';
+  const summary = out.split('\n').filter((l) => /结论|项检查|SKIP/.test(l)).pop() || '';
   if (code !== 0) {
     failed++;
     rows.push([name, 'FAIL', summary]);
@@ -31,6 +31,12 @@ for (const [name, rel] of layers) {
   } else {
     passed++;
     rows.push([name, 'PASS', summary]);
+  }
+  /* SKIP/Fail 的子进程 stdout 是被 pipe 收走的，用户看不见。这里把原文打回来 ——
+     SKIP 的价值就在「缺什么、怎么补」那几行，吞掉它等于把指南藏起来。 */
+  if (code !== 0 || /SKIP/.test(summary)) {
+    console.log(out.trimEnd());
+    console.log('');
   }
 }
 
