@@ -28,3 +28,6 @@ id_ed25519
 /INTERNAL_PROVENANCE.md
 /fm1-open-publish.md
 /.codex-sinco/
+
+# 主机测试的编译产物（wasm 每次重编，不入库）
+/tools/host_tests/**/*.wasm
