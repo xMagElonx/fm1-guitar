@@ -27,7 +27,8 @@ for (const [name, rel] of layers) {
     rows.push([name, 'FAIL', summary]);
   } else if (/SKIP/.test(summary)) {
     skipped++;
-    rows.push([name, 'SKIP', summary]);
+    /* 原文已在上面整段打回，汇总行只留一句短标题，避免重复三大段 */
+    rows.push([name, 'SKIP', '缺少 wasi-sdk 工具链（补法见上）']);
   } else {
     passed++;
     rows.push([name, 'PASS', summary]);
