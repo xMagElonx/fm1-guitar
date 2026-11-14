@@ -49,3 +49,5 @@ copyright M-VAVE.
 - Community lineage: Felucca (Hugelton Instruments), SLOOP, the FM-1 modding scene
   ([FM-1 Resource Hub](https://github.com/aroum/fm1-custom-fw),
   [awesome-fm-1](https://github.com/cicloid/awesome-fm-1))
+
+You can also try FM-1 Guitar in the browser, no flashing needed, in the free community [FM-1 Emulator](https://fm1-emulator.atst.tools/).
